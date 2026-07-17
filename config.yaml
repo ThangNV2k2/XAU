@@ -1,0 +1,20 @@
+symbol: "XAU/USD"
+
+# Diem moi indicator: +1 bullish, -1 bearish, 0 neutral.
+# weighted_score = sum(indicator_score * weight)
+weights:
+  rsi: 1.0
+  macd: 1.2
+  ema_crossover: 1.0
+  bollinger: 0.8
+
+threshold_buy: 2.0
+threshold_sell: -2.0
+
+# ATR dung de goi y khoang cach stop-loss, khong tinh vao weighted_score
+atr_stop_multiplier: 1.5
+
+live:
+  interval: "15min"   # khung nen dung khi poll gia live
+  poll_minutes: 15    # tan suat poll (phut)
+  outputsize: 100      # so nen lay ve moi lan (du warmup cho cac indicator)
