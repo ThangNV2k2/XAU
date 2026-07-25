@@ -14,7 +14,90 @@ threshold_sell: -2.0
 # ATR dung de goi y khoang cach stop-loss, khong tinh vao weighted_score
 atr_stop_multiplier: 1.5
 
+# Ke hoach quan tri von (chi tham khao, bot khong tu dat lenh).
+# Sua account_balance_usdt theo so du futures kha dung thuc te.
+trading_plan:
+  account_balance_usdt: 1000
+  risk_per_trade_pct: 0.5
+  max_leverage: 5
+  max_margin_pct: 25
+  minimum_bias: 0.25
+  slippage_fee_buffer_pct: 10
+  take_profit_1_r: 1.0
+  take_profit_2_r: 2.0
+  moderate_bias_holding_bars: 8
+  strong_bias_holding_bars: 16
+  allow_overnight: false
+
 live:
   interval: "15min"   # khung nen dung khi poll gia live
   poll_minutes: 15    # tan suat poll (phut)
   outputsize: 100      # so nen lay ve moi lan (du warmup cho cac indicator)
+  analysis_timeframes: ["15min", "1h", "4h"]
+  pressure_interval: "1min"
+  pressure_bars: 30
+
+signal_confirmation:
+  actionable_threshold: 0.40
+  minimum_timeframe_score: 0.12
+  require_all_timeframes: true
+  retest_lookback_bars: 8
+  retest_tolerance_atr: 0.15
+  recent_backtest_bars: 8
+
+peak_map:
+  timeframes: ["15min", "1h", "4h", "1day"]
+  outputsize: 200
+  fractal_span: 2
+  # ZigZag chỉ cộng điểm cho swing đã đảo chiều đủ xa; khung lớn dùng ngưỡng lớn hơn.
+  zigzag_reversal_pct:
+    15min: 0.08
+    1h: 0.15
+    4h: 0.35
+    1day: 0.80
+  reaction_lookahead_bars: 20
+  new_peak_bars: 12
+  max_distance_pct: 5.0
+  cluster_tolerance_pct: 0.04
+  zone_padding_pct: 0.02
+  minimum_zone_score: 6
+  max_resistance_zones: 3
+  max_support_zones: 2
+
+news:
+  max_items: 4
+  feeds:
+    - name: "Vàng/Thị trường"
+      language: "vi"
+      url: "https://news.google.com/rss/search?q=XAU%2FUSD%20d%E1%BB%B1%20b%C3%A1o%20gi%C3%A1%20v%C3%A0ng%20when%3A3d&hl=vi&gl=VN&ceid=VN%3Avi"
+    - name: "Địa chính trị"
+      language: "vi"
+      url: "https://news.google.com/rss/search?q=gi%C3%A1%20v%C3%A0ng%20th%E1%BA%BF%20gi%E1%BB%9Bi%20Fed%20l%E1%BA%A1m%20ph%C3%A1t%20chi%E1%BA%BFn%20tranh%20Iran%20when%3A3d&hl=vi&gl=VN&ceid=VN%3Avi"
+
+order_book_proxy:
+  enabled: true
+  symbol: "PAXGUSDT"
+  endpoint: "https://api.binance.com/api/v3/depth"
+  depth_limit: 100
+
+resistance_test:
+  cluster_atr: 0.35
+  padding_atr: 0.12
+  minimum_padding_pct: 0.00015
+  rsi_warning: 65
+  volume_spike_ratio: 1.5
+
+ai_analysis:
+  enabled: true
+  timeout_seconds: 35
+  groq:
+    model: "qwen/qwen3.6-27b"
+    usage_path: "logs/groq_usage.json"
+    daily_call_budget: 900
+    rate_limit_cooldown_minutes: 2
+  gemini:
+    model: "gemini-3.6-flash"
+    fallback_model: "gemini-3.5-flash-lite"
+    usage_path: "logs/gemini_usage.json"
+    daily_call_budget: 15
+    rate_limit_cooldown_minutes: 60

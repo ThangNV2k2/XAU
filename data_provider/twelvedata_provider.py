@@ -14,8 +14,12 @@ class TwelveDataProvider(DataProvider):
         self.api_key = api_key or os.environ["TWELVEDATA_API_KEY"]
 
     def _request(self, endpoint: str, params: dict) -> dict:
-        query = {**params, "apikey": self.api_key}
-        resp = requests.get(f"{TWELVEDATA_BASE_URL}/{endpoint}", params=query, timeout=15)
+        resp = requests.get(
+            f"{TWELVEDATA_BASE_URL}/{endpoint}",
+            params=params,
+            headers={"Authorization": f"apikey {self.api_key}"},
+            timeout=15,
+        )
         resp.raise_for_status()
         data = resp.json()
         if isinstance(data, dict) and data.get("status") == "error":
@@ -35,6 +39,7 @@ class TwelveDataProvider(DataProvider):
             "outputsize": outputsize,
             "format": "JSON",
             "order": "ASC",
+            "timezone": "UTC",
         }
         if start_date:
             params["start_date"] = start_date
@@ -47,12 +52,22 @@ class TwelveDataProvider(DataProvider):
             raise RuntimeError(f"Twelve Data returned no values for {self.symbol} ({interval}): {data}")
 
         df = pd.DataFrame(values)
-        df["datetime"] = pd.to_datetime(df["datetime"])
+        df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
         df = df.set_index("datetime").sort_index()
         for col in ("open", "high", "low", "close"):
             df[col] = df[col].astype(float)
-        return df[["open", "high", "low", "close"]]
+        columns = ["open", "high", "low", "close"]
+        if "volume" in df.columns:
+            volume = pd.to_numeric(df["volume"], errors="coerce")
+            if volume.notna().any() and float(volume.fillna(0).abs().sum()) > 0:
+                df["volume"] = volume
+                columns.append("volume")
+        return df[columns]
 
     def get_latest_price(self) -> float:
         data = self._request("price", {"symbol": self.symbol})
         return float(data["price"])
+
+    def get_quote(self) -> dict:
+        """Return the latest quote together with provider timestamps and market state."""
+        return self._request("quote", {"symbol": self.symbol})

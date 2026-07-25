@@ -14,6 +14,8 @@ cp .env.example .env
 Điền vào `.env`:
 - `TWELVEDATA_API_KEY` — đăng ký free tại [twelvedata.com](https://twelvedata.com) (free tier: 800 request/ngày, 8 request/phút — đủ dùng cho polling 15 phút/lần).
 - `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` — chưa cần ngay, chỉ cần khi bật alerting thật (xem bước 4).
+- `GROQ_API_KEY` — AI chính đọc biểu đồ bằng `qwen/qwen3.6-27b`; tạo khóa tại [Groq Console](https://console.groq.com/keys).
+- `GEMINI_API_KEY` — không bắt buộc; dùng làm AI dự phòng khi Groq lỗi hoặc đạt giới hạn.
 
 ## 2. Chạy backtest TRƯỚC KHI dùng thật
 
@@ -50,13 +52,22 @@ Thay vì tự poll và đẩy tin (main.py), cách chính để dùng tool là *
    python telegram_query_bot.py
    ```
 6. Trong Telegram, nhắn `/signal` hoặc `/gia` cho bot → nhận ngay:
-   - **Bias xu hướng ngắn hạn** (-100% đến +100%, liên tục — luôn có số cụ thể để tham khảo, không chỉ HOLD/0.00): tổng hợp RSI/MACD/EMA trend/Bollinger %B như các thước đo động lượng (momentum), không phải chờ sự kiện cắt hiếm gặp.
-   - Biên độ biến động ước lượng cho ~1h và ~4h tới (dựa trên ATR, quy tắc căn bậc hai thời gian).
-   - Tín hiệu backtest cũ (BUY/SELL/HOLD) để tham khảo thêm — tín hiệu này thận trọng hơn nên ít khi kích hoạt.
+   - Giá và trạng thái nguồn (`LIVE`, `DỮ LIỆU TRỄ` hoặc `ĐÓNG CỬA`), không giả dữ liệu cuối phiên là realtime.
+   - Một biểu đồ gộp **15m / 1H / 4H**; dữ liệu Twelve Data được yêu cầu ở UTC và chỉ nến đã đóng mới được dùng để xác nhận.
+   - Vùng hỗ trợ/kháng cự động từ swing-high, swing-low đa khung và ATR. Hai vùng được tách rời; vùng nhiễu không được dùng làm entry.
+   - Trạng thái breakout/breakdown và retest. Bot chỉ lập Entry/SL/TP/khối lượng/đòn bẩy khi đủ chuỗi: ba khung đồng thuận → nến 15m đóng phá vùng → nến sau retest xác nhận → tín hiệu backtest gần đây cùng hướng → giá hiện vẫn ở vùng vào.
+   - Phân tích AI mới từ Groq, tự chuyển sang Gemini nếu cần. Luồng `/gia` không tái sử dụng cache AI hoặc cache tin tức.
+   - AI nhận ảnh gộp cùng 8 nến OHLC gần nhất của mỗi khung, vùng giá, động lượng và tin tiếng Việt. AI không tự gọi thêm dữ liệu và không được tự tạo hay sửa Entry/SL/TP; nếu code chưa xác nhận entry thì kết luận AI bị ép thành `ĐỨNG NGOÀI`.
+
+7. Nhắn `/dinh` để nhận bản đồ đỉnh chuyên biệt:
+   - Quét nến đã đóng 15m/1H/4H/D1 bằng Williams Fractal 5 nến.
+   - Lọc nhiễu bằng ZigZag với deviation riêng cho từng khung; điểm ZigZag cuối chưa có swing ngược xác nhận không được cộng uy tín.
+   - Gom các đỉnh gần nhau thành vùng, phân biệt đỉnh cũ/mới và chấm uy tín theo khung, số đỉnh hội tụ, phản ứng sau đỉnh và volume nếu nguồn thực sự có.
+   - Đỉnh nằm trên giá được trình bày như cản; đỉnh cũ đã được nến 15m đóng vượt được trình bày riêng như hỗ trợ retest tiềm năng.
 
    Chỉ chat có `chat_id` khớp trong `.env` mới được bot trả lời (người khác nhắn bot sẽ bị bỏ qua, tránh lộ và tốn quota API).
 
-**Quan trọng:** con số "bias" là chỉ số kỹ thuật đọc trạng thái động lượng hiện tại, **chưa được backtest riêng và không đảm bảo đúng hướng**. Tín hiệu BUY/SELL/HOLD (mục 2) mới là cái đã backtest — và kết quả gần nhất cho thấy **chưa có edge ổn định** (win rate ~47%, profit factor ~0.5, xem mục 2). Dùng để tham khảo thêm góc nhìn, không phải căn cứ duy nhất để vào lệnh đòn bẩy trên Binance.
+**Quan trọng:** hỗ trợ/kháng cự và retest chỉ làm giảm việc đuổi giá, không biến tín hiệu thành dự đoán chắc chắn. Kết quả backtest gần nhất vẫn **chưa có edge ổn định** (win rate ~47%, profit factor ~0.5, xem mục 2). Không dùng riêng bot hoặc AI làm căn cứ vào lệnh đòn bẩy.
 
 ### (Tuỳ chọn) Cách cũ: bot tự poll và đẩy tin khi tín hiệu đổi
 
@@ -71,6 +82,9 @@ python main.py             # chạy thật, đẩy tin khi tín hiệu đổi tr
 - `threshold_buy` / `threshold_sell` — ngưỡng điểm để ra tín hiệu BUY/SELL (chỉ áp dụng cho tín hiệu backtest, không áp dụng cho bias liên tục).
 - `atr_stop_multiplier` — hệ số nhân ATR(14) để gợi ý khoảng cách stop-loss (không ảnh hưởng tín hiệu hướng).
 - `live.interval` / `live.poll_minutes` / `live.outputsize` — khung nến và tần suất polling khi chạy live.
+- `signal_confirmation` — ngưỡng đồng thuận ba khung, số nến tìm retest, độ rộng vùng retest và số nến tìm tín hiệu backtest xác nhận.
+- `resistance_test` — độ gom cụm swing theo ATR, độ rộng vùng và các ngưỡng kiểm tra từ chối giá.
+- `peak_map` — các khung của `/dinh`, span Fractal, deviation ZigZag, độ gom vùng và số vùng tối đa cần hiển thị.
 
 ## 6. Cấu trúc project
 
