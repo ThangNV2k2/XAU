@@ -1,4 +1,9 @@
-symbol: "XAU/USD"
+symbol: "XAUUSDT"
+
+market_data:
+  provider: "binance_futures"
+  base_url: "https://fapi.binance.com"
+  websocket_base_url: "wss://fstream.binance.com"
 
 # Diem moi indicator: +1 bullish, -1 bearish, 0 neutral.
 # weighted_score = sum(indicator_score * weight)
@@ -21,6 +26,10 @@ trading_plan:
   risk_per_trade_pct: 0.5
   max_leverage: 5
   max_margin_pct: 25
+  price_tick: 0.01
+  quantity_step: 0.001
+  minimum_quantity: 0.001
+  minimum_notional_usdt: 5
   minimum_bias: 0.25
   slippage_fee_buffer_pct: 10
   take_profit_1_r: 1.0
@@ -64,6 +73,21 @@ peak_map:
   max_resistance_zones: 3
   max_support_zones: 2
 
+# /dinh chỉ sinh Entry/SL/TP sau khi gate nến đóng đã xác nhận.
+peak_execution:
+  require_1h_close_confirmation: true
+  entry_buffer_atr: 0.15
+  stop_buffer_atr: 0.20
+  minimum_structural_rr: 1.5
+  take_profit_1_r: 1.0
+
+peak_liquidity:
+  block_weekend_entries: true
+  recent_volume_hours: 6
+  volume_baseline_hours: 168
+  minimum_volume_ratio: 0.45
+  maximum_spread_bps: 3.0
+
 news:
   max_items: 4
   feeds:
@@ -74,10 +98,10 @@ news:
       language: "vi"
       url: "https://news.google.com/rss/search?q=gi%C3%A1%20v%C3%A0ng%20th%E1%BA%BF%20gi%E1%BB%9Bi%20Fed%20l%E1%BA%A1m%20ph%C3%A1t%20chi%E1%BA%BFn%20tranh%20Iran%20when%3A3d&hl=vi&gl=VN&ceid=VN%3Avi"
 
-order_book_proxy:
+order_book:
   enabled: true
-  symbol: "PAXGUSDT"
-  endpoint: "https://api.binance.com/api/v3/depth"
+  symbol: "XAUUSDT"
+  endpoint: "https://fapi.binance.com/fapi/v1/depth"
   depth_limit: 100
 
 resistance_test:
@@ -89,6 +113,7 @@ resistance_test:
 
 ai_analysis:
   enabled: true
+  peak_review_enabled: true
   timeout_seconds: 35
   groq:
     model: "qwen/qwen3.6-27b"

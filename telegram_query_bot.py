@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, filters
 
-from data_provider.twelvedata_provider import TwelveDataProvider
+from data_provider.binance_futures_provider import BinanceFuturesProvider
 from indicators.signal_engine import (
     MomentumBias,
     SignalResult,
@@ -22,8 +22,12 @@ from ai_analysis import (
     ai_daily_budget_available,
     analyze_with_gemini,
     analyze_with_groq,
+    analyze_peak_with_gemini,
+    analyze_peak_with_groq,
     build_ai_snapshot,
+    build_peak_ai_snapshot,
     format_ai_analysis,
+    format_peak_ai_review,
     is_ai_rate_limit_error,
     record_ai_call,
 )
@@ -48,8 +52,18 @@ from market_context import (
     render_multi_timeframe_chart,
     select_closed_candles,
 )
-from realtime_price import RealtimeQuote, TwelveDataPriceStream
-from peak_analysis import build_peak_map, format_peak_map
+from realtime_price import BinanceFuturesPriceStream, RealtimeQuote
+from peak_analysis import (
+    PeakExecutionPlan,
+    PeakLiquidityAssessment,
+    PeakTradeGate,
+    assess_peak_liquidity,
+    assess_peak_trade_gate,
+    build_peak_execution_plan,
+    build_peak_map,
+    format_peak_map,
+    render_peak_hourly_chart,
+)
 
 load_dotenv()
 
@@ -71,10 +85,7 @@ def load_config(path: str = "config.yaml") -> dict:
 
 
 def get_current_quote(provider, price_stream) -> RealtimeQuote:
-    realtime_quote = price_stream.latest()
-    if realtime_quote is not None:
-        return realtime_quote
-
+    stream_quote = price_stream.latest()
     quote = provider.get_quote()
     quote_timestamp = int(quote.get("last_quote_at") or quote.get("timestamp") or 0)
     market_open_value = quote.get("is_market_open", False)
@@ -83,12 +94,61 @@ def get_current_quote(provider, price_stream) -> RealtimeQuote:
         if isinstance(market_open_value, bool)
         else str(market_open_value).strip().lower() == "true"
     )
+    rest_market_time = datetime.fromtimestamp(quote_timestamp, tz=timezone.utc)
     return RealtimeQuote(
-        price=float(quote["close"]),
-        market_time=datetime.fromtimestamp(quote_timestamp, tz=timezone.utc),
+        price=(stream_quote.price if stream_quote is not None else float(quote["close"])),
+        market_time=(
+            stream_quote.market_time if stream_quote is not None else rest_market_time
+        ),
         received_at=datetime.now(timezone.utc),
-        source="REST fallback",
+        source=(
+            "Binance Futures WebSocket + REST metrics"
+            if stream_quote is not None
+            else str(quote.get("source", "REST fallback"))
+        ),
         is_market_open=is_market_open,
+        mark_price=(
+            float(quote["mark_price"])
+            if quote.get("mark_price") is not None
+            else None
+        ),
+        index_price=(
+            float(quote["index_price"])
+            if quote.get("index_price") is not None
+            else None
+        ),
+        bid_price=(
+            stream_quote.bid_price
+            if stream_quote is not None and stream_quote.bid_price is not None
+            else float(quote["bid"])
+            if quote.get("bid") is not None
+            else None
+        ),
+        ask_price=(
+            stream_quote.ask_price
+            if stream_quote is not None and stream_quote.ask_price is not None
+            else float(quote["ask"])
+            if quote.get("ask") is not None
+            else None
+        ),
+        funding_rate=(
+            float(quote["funding_rate"])
+            if quote.get("funding_rate") is not None
+            else None
+        ),
+        next_funding_time=(
+            datetime.fromtimestamp(
+                int(quote["next_funding_time"]),
+                tz=timezone.utc,
+            )
+            if quote.get("next_funding_time") is not None
+            else None
+        ),
+        open_interest=(
+            float(quote["open_interest"])
+            if quote.get("open_interest") is not None
+            else None
+        ),
     )
 
 
@@ -109,6 +169,7 @@ class TradingPlan:
     margin_usdt: float
     margin_pct: float
     actual_risk_pct: float
+    account_balance_usdt: float
     holding_style: str
     max_holding_minutes: int
     allow_overnight: bool
@@ -138,6 +199,8 @@ def build_trading_plan(
     side_override: str | None = None,
     entry_override: float | None = None,
     stop_override: float | None = None,
+    take_profit_1_override: float | None = None,
+    take_profit_2_override: float | None = None,
 ) -> TradingPlan | None:
     """Size a hypothetical isolated-margin position from a fixed account-risk budget."""
     minimum_bias = float(settings.get("minimum_bias", 0.25))
@@ -154,6 +217,8 @@ def build_trading_plan(
 
     side = side_override or ("LONG" if bias.composite > 0 else "SHORT")
     entry = float(entry_override if entry_override is not None else result.price)
+    price_tick = max(float(settings.get("price_tick", 0.01)), 1e-9)
+    entry = round(entry / price_tick) * price_tick
     stop_distance = (
         abs(entry - float(stop_override))
         if stop_override is not None
@@ -166,6 +231,12 @@ def build_trading_plan(
     # Keep isolated margin below the configured account percentage, even at max leverage.
     max_margin = balance * max_margin_pct / 100
     quantity = min(quantity, max_margin * max_leverage / entry)
+    quantity_step = max(float(settings.get("quantity_step", 0.001)), 1e-9)
+    quantity = math.floor(quantity / quantity_step) * quantity_step
+    minimum_quantity = float(settings.get("minimum_quantity", 0.001))
+    minimum_notional = float(settings.get("minimum_notional_usdt", 5))
+    if quantity < minimum_quantity or quantity * entry < minimum_notional:
+        return None
     notional = quantity * entry
     leverage = max(1, min(max_leverage, math.ceil(notional / max_margin)))
     margin = notional / leverage
@@ -179,12 +250,41 @@ def build_trading_plan(
     max_holding_minutes = interval_to_minutes(interval) * max(1, holding_bars)
 
     direction = 1 if side == "LONG" else -1
+    stop = round((entry - direction * stop_distance) / price_tick) * price_tick
+    take_profit_1 = (
+        round(float(take_profit_1_override) / price_tick) * price_tick
+        if take_profit_1_override is not None
+        else round(
+            (
+                entry
+                + direction
+                * stop_distance
+                * float(settings.get("take_profit_1_r", 1.0))
+            )
+            / price_tick
+        )
+        * price_tick
+    )
+    take_profit_2 = (
+        round(float(take_profit_2_override) / price_tick) * price_tick
+        if take_profit_2_override is not None
+        else round(
+            (
+                entry
+                + direction
+                * stop_distance
+                * float(settings.get("take_profit_2_r", 2.0))
+            )
+            / price_tick
+        )
+        * price_tick
+    )
     return TradingPlan(
         side=side,
         entry=entry,
-        stop=entry - direction * stop_distance,
-        take_profit_1=entry + direction * stop_distance * float(settings.get("take_profit_1_r", 1.0)),
-        take_profit_2=entry + direction * stop_distance * float(settings.get("take_profit_2_r", 2.0)),
+        stop=stop,
+        take_profit_1=take_profit_1,
+        take_profit_2=take_profit_2,
         risk_usdt=actual_risk,
         quantity_xau=quantity,
         notional_usdt=notional,
@@ -192,10 +292,87 @@ def build_trading_plan(
         margin_usdt=margin,
         margin_pct=margin / balance * 100,
         actual_risk_pct=actual_risk / balance * 100,
+        account_balance_usdt=balance,
         holding_style="ngan han trong ngay",
         max_holding_minutes=max_holding_minutes,
         allow_overnight=bool(settings.get("allow_overnight", False)),
     )
+
+
+def format_peak_execution_guide(
+    gate: PeakTradeGate,
+    execution_plan: PeakExecutionPlan | None,
+    execution_reason: str,
+    sized_plan: TradingPlan | None,
+    liquidity: PeakLiquidityAssessment,
+    hourly_structure: ChartStructure,
+    hourly_score: float,
+) -> str:
+    resistance = gate.resistance
+    ratio_text = (
+        f"{liquidity.volume_ratio:.0%} median ngày thường"
+        if liquidity.volume_ratio is not None
+        else "chưa đủ mẫu so sánh"
+    )
+    lines = [
+        "🎯 HƯỚNG DẪN THỰC THI",
+        f"• 1H: {hourly_structure.pattern} · bias {hourly_score * 100:+.0f}% · "
+        f"S {hourly_structure.support:.2f} / R {hourly_structure.resistance:.2f} · "
+        f"xác nhận {'ĐẠT' if gate.hourly_confirmed else 'CHƯA ĐẠT'}.",
+        f"• Thanh khoản: {liquidity.status} · volume {ratio_text}. {liquidity.reason}",
+    ]
+    if resistance is None:
+        return "\n".join(lines + ["• KHÔNG VÀO: chưa có vùng cản đủ tin cậy để lập kế hoạch."])
+
+    if execution_plan is None:
+        lines += [
+            f"• Hiện tại: KHÔNG VÀO — {execution_reason}",
+            f"• SHORT: chờ giá hồi vào {resistance.lower:.2f}–{resistance.upper:.2f}; "
+            f"15m từ chối và 1H đóng dưới {resistance.lower:.2f}, rồi retest không vượt lại vùng.",
+            f"• LONG: chờ 15m đóng trên {resistance.upper:.2f}; nến sau retest "
+            f"{resistance.lower:.2f}–{resistance.upper:.2f}, đồng thời 1H đóng trên {resistance.upper:.2f}.",
+            "• Lúc này chưa đặt Limit/SL/TP. Đủ điều kiện thì gọi /dinh lại; râu nến không tính xác nhận.",
+        ]
+        return "\n".join(lines)
+
+    plan = execution_plan
+    retest_action = (
+        "giữ trên vùng phá"
+        if plan.side == "LONG"
+        else "không vượt lại cản"
+    )
+    entry_button = "Mua/Long" if plan.side == "LONG" else "Bán/Short"
+    close_button = "Bán/Close Long" if plan.side == "LONG" else "Mua/Close Short"
+    lines += [
+        f"• {plan.side}: chờ giá quay lại {plan.entry_lower:.2f}–{plan.entry_upper:.2f} "
+        f"và nến 15m retest {retest_action}; 1H đã đóng xác nhận, không đuổi giá.",
+        f"• Entry tham chiếu {plan.entry_reference:.2f} · SL {plan.stop_loss:.2f} "
+        "(Stop-Market, ưu tiên trigger Mark Price).",
+        f"• TP1 {plan.take_profit_1:.2f} ({plan.reward_risk_1:.1f}R) · "
+        f"TP2 {plan.take_profit_2:.2f} ({plan.reward_risk_2:.1f}R, {plan.structural_target}).",
+    ]
+    if sized_plan is not None:
+        lines += [
+            f"• Vốn: {sized_plan.quantity_xau:.3f} XAU · {sized_plan.leverage}x isolated · "
+            f"rủi ro tối đa {sized_plan.risk_usdt:.2f} USDT "
+            f"({sized_plan.actual_risk_pct:.2f}% trên số dư cấu hình "
+            f"{sized_plan.account_balance_usdt:.2f} USDT).",
+            f"• Quản lệnh: chốt 50% ở TP1, phần còn lại dời SL về Entry; "
+            f"time-stop ~{format_duration(sized_plan.max_holding_minutes)}, không giữ qua ngày.",
+            "",
+            "CÁCH ĐẶT TRÊN BINANCE",
+            f"1) Chọn Isolated {sized_plan.leverage}x → Limit {entry_button} "
+            f"{sized_plan.quantity_xau:.3f} XAU trong vùng Entry; hết vùng thì hủy, không Market đuổi.",
+            f"2) Sau khi Entry khớp → đặt Stop-Market {close_button} toàn bộ vị thế tại "
+            f"{plan.stop_loss:.2f}; trigger Mark Price và chọn Close Position/Reduce-Only nếu giao diện có.",
+            f"3) Đặt TP Limit {close_button}: 50% tại {plan.take_profit_1:.2f}; "
+            f"phần còn lại tại {plan.take_profit_2:.2f}, đều chỉ giảm vị thế.",
+            "4) TP1 khớp → dời SL phần còn lại về Entry; vị thế đã đóng thì hủy mọi lệnh SL/TP còn treo.",
+        ]
+    else:
+        lines.append("• Không tính được khối lượng an toàn với số dư/cấu hình hiện tại; không vào lệnh.")
+    lines.append("• Hủy kế hoạch nếu nến 15m đóng phá SL trước khi khớp Entry.")
+    return "\n".join(lines)
 
 
 def format_reply(bias: MomentumBias, result: SignalResult, interval: str, plan_settings: dict) -> str:
@@ -209,7 +386,7 @@ def format_reply(bias: MomentumBias, result: SignalResult, interval: str, plan_s
     pct = bias.composite * 100
 
     lines = [
-        f"*XAU/USD*: {bias.price:.2f} USD/oz",
+        f"*Binance XAUUSDT PERP*: {bias.price:.2f} USDT/oz",
         f"Xu huong ngan han: *{bias.label}* (bias {pct:+.0f}%)",
         "",
         "Chi tiet (moi chi bao tu -100% den +100%):",
@@ -292,7 +469,7 @@ def format_enhanced_reply(
     )
 
     lines = [
-        f"*XAU/USD real-time*: {bias.price:.2f} USD/oz",
+        f"*Binance XAUUSDT PERP real-time*: {bias.price:.2f} USDT/oz",
         f"Gia nhan ~{quote_received_age_seconds:.1f}s truoc qua {quote_source}; "
         f"moc thoi gian nguon {quote_time.astimezone().strftime('%d/%m %H:%M:%S')} "
         f"(nguon lam tron/tre ~{quote_age_seconds:.0f}s) | "
@@ -385,11 +562,7 @@ def format_compact_reply(
     structures: dict[str, ChartStructure],
     resistance_test: ResistanceZoneAnalysis,
     retest: RetestAssessment,
-    quote_time: datetime,
-    quote_market_age_seconds: float,
-    quote_received_age_seconds: float,
-    quote_source: str,
-    is_market_open: bool,
+    realtime_quote: RealtimeQuote,
 ) -> tuple[str, TradingPlan | None, ScenarioLevels]:
     planning_bias = MomentumBias(
         price=bias.price,
@@ -419,6 +592,7 @@ def format_compact_reply(
     forecast = plan.side if plan is not None else "CHỜ"
 
     pressure_side = "mua" if pressure.score > 0.08 else "bán" if pressure.score < -0.08 else "cân bằng"
+    pressure_source = "taker flow thật" if pressure.uses_trade_flow else "price action"
     order_book_text = "không có"
     if order_book is not None:
         order_side = "mua" if order_book.score > 0.08 else "bán" if order_book.score < -0.08 else "cân bằng"
@@ -430,7 +604,16 @@ def format_compact_reply(
     volume_text = (
         f"{resistance_test.volume_ratio:.2f}x trung bình 20 nến"
         if resistance_test.volume_ratio is not None
-        else "không có volume spot đáng tin"
+        else "chưa có volume hợp lệ"
+    )
+    quote_time = realtime_quote.market_time
+    quote_market_age_seconds = max(
+        0.0,
+        (datetime.now(timezone.utc) - quote_time).total_seconds(),
+    )
+    quote_received_age_seconds = max(
+        0.0,
+        (datetime.now(timezone.utc) - realtime_quote.received_at).total_seconds(),
     )
     if quote_market_age_seconds < 90:
         market_age = f"{quote_market_age_seconds:.0f}s"
@@ -440,16 +623,40 @@ def format_compact_reply(
         market_age = f"{quote_market_age_seconds / 3600:.1f} giờ"
     else:
         market_age = f"{quote_market_age_seconds / 86400:.1f} ngày"
-    if not is_market_open:
+    if not realtime_quote.is_market_open:
         feed_status = f"ĐÓNG CỬA · giá cuối cách {market_age}"
     elif quote_market_age_seconds > 120 or quote_received_age_seconds > 120:
         feed_status = f"DỮ LIỆU TRỄ {market_age}"
     else:
         feed_status = f"LIVE {quote_received_age_seconds:.1f}s"
 
+    fair_value_lines = []
+    if realtime_quote.mark_price is not None and realtime_quote.index_price is not None:
+        basis = realtime_quote.mark_price - realtime_quote.index_price
+        fair_value_lines.append(
+            f"Mark {realtime_quote.mark_price:.2f} · Index {realtime_quote.index_price:.2f} · basis {basis:+.2f}"
+        )
+    if realtime_quote.bid_price is not None and realtime_quote.ask_price is not None:
+        spread = realtime_quote.ask_price - realtime_quote.bid_price
+        fair_value_lines.append(
+            f"Bid {realtime_quote.bid_price:.2f} · Ask {realtime_quote.ask_price:.2f} · spread {spread:.2f}"
+        )
+    derivatives_parts = []
+    if realtime_quote.funding_rate is not None:
+        derivatives_parts.append(f"funding {realtime_quote.funding_rate * 100:+.4f}%")
+    if realtime_quote.next_funding_time is not None:
+        derivatives_parts.append(
+            "kỳ tới " + realtime_quote.next_funding_time.astimezone().strftime("%H:%M")
+        )
+    if realtime_quote.open_interest is not None:
+        derivatives_parts.append(f"OI {realtime_quote.open_interest:,.0f}")
+    if derivatives_parts:
+        fair_value_lines.append(" · ".join(derivatives_parts))
+
     lines = [
-        f"📊 *XAU/USD {bias.price:.2f}* · {feed_status} · {quote_source}",
+        f"📊 *XAUUSDT PERP {bias.price:.2f}* · {feed_status} · {realtime_quote.source}",
         f"Nguồn lúc {quote_time.astimezone().strftime('%d/%m %H:%M:%S')}",
+        *fair_value_lines,
         f"🧭 *QUYẾT ĐỊNH: {forecast}* — {retest.decision_reason}",
         "",
         "🧱 *VÙNG GIÁ*",
@@ -478,7 +685,8 @@ def format_compact_reply(
         f"🔎 Nến đóng: 15m {consensus.scores.get('15min', 0) * 100:+.0f}% · "
         f"1H {consensus.scores.get('1h', 0) * 100:+.0f}% · "
         f"4H {consensus.scores.get('4h', 0) * 100:+.0f}% · RSI {resistance_test.rsi14:.0f}.",
-        f"Áp lực 1m {pressure_side} {pressure.score * 100:+.0f}% · PAXG {order_book_text} · volume {volume_text}.",
+        f"Áp lực 1m {pressure_side} {pressure.score * 100:+.0f}% ({pressure_source}) · "
+        f"Order book XAU {order_book_text} · volume {volume_text}.",
         f"Tin tức: {news_risk} ({news_status}).",
         "_Chỉ dùng nến đã đóng để xác nhận; vùng giá không bảo đảm đảo chiều._",
     ]
@@ -524,12 +732,18 @@ async def handle_signal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             analysis_now,
         )
         pressure = analyze_price_pressure(pressure_df)
-        order_book_config = config.get("order_book_proxy", {})
+        order_book_config = config.get(
+            "order_book",
+            config.get("order_book_proxy", {}),
+        )
         order_book = None
         if order_book_config.get("enabled", True):
             order_book = fetch_order_book_pressure(
-                order_book_config.get("endpoint", "https://api.binance.com/api/v3/depth"),
-                order_book_config.get("symbol", "PAXGUSDT"),
+                order_book_config.get(
+                    "endpoint",
+                    "https://fapi.binance.com/fapi/v1/depth",
+                ),
+                order_book_config.get("symbol", "XAUUSDT"),
                 int(order_book_config.get("depth_limit", 100)),
             )
         pressure_input = pressure.score if order_book is None else 0.6 * pressure.score + 0.4 * order_book.score
@@ -556,13 +770,15 @@ async def handle_signal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         legacy_long_confirmed = "BUY" in recent_signals
         legacy_short_confirmed = "SELL" in recent_signals
         realtime_quote = get_current_quote(provider, price_stream)
+        if realtime_quote.open_interest is None and hasattr(
+            provider,
+            "get_open_interest",
+        ):
+            try:
+                realtime_quote.open_interest = provider.get_open_interest()
+            except Exception:
+                logger.warning("Could not fetch Binance Futures open interest")
         latest_price = realtime_quote.price
-        quote_time = realtime_quote.market_time
-        quote_age_seconds = max(0.0, (datetime.now(timezone.utc) - quote_time).total_seconds())
-        quote_received_age_seconds = max(
-            0.0,
-            (datetime.now(timezone.utc) - realtime_quote.received_at).total_seconds(),
-        )
         bias.price = latest_price
         result.price = latest_price
         resistance_test = analyze_resistance_zone(
@@ -603,11 +819,7 @@ async def handle_signal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             structures,
             resistance_test,
             retest,
-            quote_time,
-            quote_age_seconds,
-            quote_received_age_seconds,
-            realtime_quote.source,
-            realtime_quote.is_market_open,
+            realtime_quote,
         )
         multi_chart = render_multi_timeframe_chart(
             frames=frames,
@@ -617,7 +829,7 @@ async def handle_signal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             current_price=latest_price,
             plan=plan,
         )
-        charts = {"15m / 1H / 4H": multi_chart}
+        charts = {"XAUUSDT 15m / 1H / 4H": multi_chart}
         logger.info(
             "Signal requested by chat %s: consensus=%.2f actionable=%s signal=%s",
             update.effective_chat.id,
@@ -627,7 +839,7 @@ async def handle_signal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
         await update.message.reply_photo(
             photo=multi_chart,
-            caption="XAU/USD: 15m · 1H · 4H, chỉ dùng nến đã đóng.",
+            caption="Binance XAUUSDT PERP: 15m · 1H · 4H, chỉ dùng nến đã đóng.",
         )
         await update.message.reply_text(
             reply,
@@ -655,6 +867,23 @@ async def handle_signal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 resistance_test=resistance_test,
                 frames=frames,
                 retest=retest,
+                derivatives_metrics={
+                    "last_price": round(realtime_quote.price, 4),
+                    "mark_price": (
+                        round(realtime_quote.mark_price, 4)
+                        if realtime_quote.mark_price is not None
+                        else None
+                    ),
+                    "index_price": (
+                        round(realtime_quote.index_price, 4)
+                        if realtime_quote.index_price is not None
+                        else None
+                    ),
+                    "bid": realtime_quote.bid_price,
+                    "ask": realtime_quote.ask_price,
+                    "funding_rate": realtime_quote.funding_rate,
+                    "open_interest": realtime_quote.open_interest,
+                },
             )
             candidates = []
             groq_config = ai_config.get("groq", {})
@@ -829,6 +1058,15 @@ async def handle_peaks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             current_price=realtime_quote.price,
             settings=settings,
         )
+        liquidity = assess_peak_liquidity(
+            frames["1h"],
+            realtime_quote.price,
+            realtime_quote.bid_price,
+            realtime_quote.ask_price,
+            analysis_now=analysis_now,
+            settings=config.get("peak_liquidity", {}),
+        )
+        hourly_structure = find_chart_structure(frames["1h"])
         reply = format_peak_map(peak_map, settings)
         logger.info(
             "Peak map requested by chat %s: peaks=%s resistance=%s support=%s",
@@ -837,11 +1075,283 @@ async def handle_peaks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             len(peak_map.resistance_zones),
             len(peak_map.converted_support_zones),
         )
+        try:
+            hourly_chart = render_peak_hourly_chart(
+                frames["1h"],
+                peak_map,
+                liquidity,
+            )
+            await update.message.reply_photo(
+                photo=hourly_chart,
+                caption=(
+                    "XAUUSDT 1H · nến đã đóng · EMA9/EMA21 · "
+                    "kháng cự/hỗ trợ và volume thật."
+                ),
+            )
+        except Exception:
+            logger.exception("Could not render/send peak 1H chart")
         await update.message.reply_text(
             reply,
             parse_mode="Markdown",
             disable_web_page_preview=True,
         )
+        analysis_frames = {
+            timeframe: frame
+            for timeframe, frame in frames.items()
+            if timeframe in ("15min", "1h", "4h")
+        }
+        momentum_biases = {
+            timeframe: compute_momentum_bias(
+                frame,
+                config["weights"],
+            )
+            for timeframe, frame in analysis_frames.items()
+        }
+        momentum_scores = {
+            timeframe: bias.composite
+            for timeframe, bias in momentum_biases.items()
+        }
+        gate = assess_peak_trade_gate(
+            peak_map,
+            frames["15min"],
+            momentum_scores,
+            {
+                **settings,
+                **config.get("signal_confirmation", {}),
+                **config.get("peak_execution", {}),
+            },
+            frame_1h=frames["1h"],
+            liquidity=liquidity,
+        )
+        execution_settings = {
+            **config.get("trading_plan", {}),
+            **config.get("peak_execution", {}),
+        }
+        execution_plan, execution_reason = build_peak_execution_plan(
+            peak_map,
+            gate,
+            frames["15min"],
+            execution_settings,
+        )
+        sized_plan = None
+        if execution_plan is not None:
+            signal_result = compute_signal(
+                frames["15min"],
+                config["weights"],
+                {
+                    "buy": config["threshold_buy"],
+                    "sell": config["threshold_sell"],
+                },
+                atr_stop_multiplier=config.get("atr_stop_multiplier", 1.5),
+            )
+            sized_plan = build_trading_plan(
+                momentum_biases["15min"],
+                signal_result,
+                {
+                    **config.get("trading_plan", {}),
+                    "minimum_bias": 0.0,
+                },
+                actionable=True,
+                side_override=execution_plan.side,
+                entry_override=execution_plan.entry_reference,
+                stop_override=execution_plan.stop_loss,
+                take_profit_1_override=execution_plan.take_profit_1,
+                take_profit_2_override=execution_plan.take_profit_2,
+            )
+        execution_guide = format_peak_execution_guide(
+            gate,
+            execution_plan,
+            execution_reason,
+            sized_plan,
+            liquidity,
+            hourly_structure,
+            momentum_scores["1h"],
+        )
+        ai_execution_plan = execution_plan if sized_plan is not None else None
+        ai_execution_reason = execution_reason
+        if execution_plan is not None and sized_plan is None:
+            ai_execution_reason += " Không tính được khối lượng an toàn nên không được đặt lệnh."
+
+        ai_config = config.get("ai_analysis", {})
+        if ai_config.get("enabled", True) and ai_config.get(
+            "peak_review_enabled",
+            True,
+        ):
+            snapshot = build_peak_ai_snapshot(
+                peak_map=peak_map,
+                gate=gate,
+                frames=frames,
+                momentum_scores=momentum_scores,
+                derivatives_metrics={
+                    "last_or_mid_price": realtime_quote.price,
+                    "mark_price": realtime_quote.mark_price,
+                    "index_price": realtime_quote.index_price,
+                    "bid": realtime_quote.bid_price,
+                    "ask": realtime_quote.ask_price,
+                    "funding_rate": realtime_quote.funding_rate,
+                    "open_interest": realtime_quote.open_interest,
+                },
+                execution_plan=ai_execution_plan,
+                execution_reason=ai_execution_reason,
+                liquidity=liquidity,
+                hourly_structure=hourly_structure,
+            )
+            timeout_seconds = int(ai_config.get("timeout_seconds", 35))
+            candidates = []
+            groq_key = os.getenv("GROQ_API_KEY")
+            groq_config = ai_config.get("groq", {})
+            if groq_key:
+                groq_model = groq_config.get("model", "qwen/qwen3.6-27b")
+                candidates.append(
+                    {
+                        "provider": "Groq",
+                        "model": groq_model,
+                        "label": f"Groq · {groq_model}",
+                        "api_key": groq_key,
+                        "analyzer": analyze_peak_with_groq,
+                        "usage_path": groq_config.get(
+                            "usage_path",
+                            "logs/groq_usage.json",
+                        ),
+                        "daily_budget": int(
+                            groq_config.get("daily_call_budget", 900)
+                        ),
+                        "cooldown_minutes": int(
+                            groq_config.get("rate_limit_cooldown_minutes", 2)
+                        ),
+                    }
+                )
+
+            gemini_key = os.getenv("GEMINI_API_KEY")
+            gemini_config = ai_config.get("gemini", {})
+            if gemini_key:
+                gemini_models = [
+                    gemini_config.get("model", "gemini-3.6-flash"),
+                    gemini_config.get(
+                        "fallback_model",
+                        "gemini-3.5-flash-lite",
+                    ),
+                ]
+                for gemini_model in dict.fromkeys(filter(None, gemini_models)):
+                    candidates.append(
+                        {
+                            "provider": "Gemini",
+                            "model": gemini_model,
+                            "label": f"Gemini · {gemini_model}",
+                            "api_key": gemini_key,
+                            "analyzer": analyze_peak_with_gemini,
+                            "usage_path": gemini_config.get(
+                                "usage_path",
+                                "logs/gemini_usage.json",
+                            ),
+                            "daily_budget": int(
+                                gemini_config.get("daily_call_budget", 15)
+                            ),
+                            "cooldown_minutes": int(
+                                gemini_config.get(
+                                    "rate_limit_cooldown_minutes",
+                                    60,
+                                )
+                            ),
+                        }
+                    )
+
+            if not candidates:
+                await update.message.reply_text(
+                    execution_guide
+                    + "\n\n🤖 AI review đỉnh chưa được cấu hình; kế hoạch code phía trên vẫn dùng được."
+                )
+            else:
+                review = None
+                used_label = None
+                last_error = None
+                unavailable_reasons = []
+                for candidate in candidates:
+                    blocker_key = (
+                        f"ai_blocked_until:{candidate['provider']}:"
+                        f"{candidate['model']}"
+                    )
+                    blocked_until = context.bot_data.get(blocker_key)
+                    if (
+                        blocked_until is not None
+                        and datetime.now(timezone.utc) < blocked_until
+                    ):
+                        unavailable_reasons.append(
+                            f"{candidate['label']} đang chờ rate limit"
+                        )
+                        continue
+                    if not ai_daily_budget_available(
+                        candidate["usage_path"],
+                        candidate["daily_budget"],
+                    ):
+                        unavailable_reasons.append(
+                            f"{candidate['label']} đã hết ngân sách ngày"
+                        )
+                        continue
+                    record_ai_call(candidate["usage_path"])
+                    try:
+                        review = await asyncio.wait_for(
+                            asyncio.to_thread(
+                                candidate["analyzer"],
+                                candidate["api_key"],
+                                candidate["model"],
+                                timeout_seconds,
+                                snapshot,
+                            ),
+                            timeout=timeout_seconds + 5,
+                        )
+                        used_label = candidate["label"]
+                        break
+                    except Exception as exc:
+                        last_error = exc
+                        if is_ai_rate_limit_error(exc):
+                            context.bot_data[blocker_key] = (
+                                datetime.now(timezone.utc)
+                                + timedelta(
+                                    minutes=candidate["cooldown_minutes"]
+                                )
+                            )
+                            logger.warning(
+                                "Peak AI %s rate-limited; trying fallback",
+                                candidate["label"],
+                            )
+                            continue
+                        logger.warning(
+                            "Peak AI %s failed: %s",
+                            candidate["label"],
+                            type(exc).__name__,
+                        )
+                        continue
+
+                if review is not None and used_label is not None:
+                    await update.message.reply_text(
+                        execution_guide
+                        + "\n\n"
+                        + format_peak_ai_review(
+                            review,
+                            used_label,
+                            gate,
+                        )
+                    )
+                elif last_error and is_ai_rate_limit_error(last_error):
+                    await update.message.reply_text(
+                        execution_guide
+                        + "\n\n🤖 AI review đỉnh đang bị rate limit; bot không dùng kết quả cũ."
+                    )
+                elif unavailable_reasons:
+                    await update.message.reply_text(
+                        execution_guide
+                        + "\n\n🤖 AI review: "
+                        + "; ".join(unavailable_reasons)
+                        + "."
+                    )
+                else:
+                    await update.message.reply_text(
+                        execution_guide
+                        + "\n\n🤖 AI review đỉnh tạm lỗi; kế hoạch code phía trên vẫn là dữ liệu mới."
+                    )
+        else:
+            await update.message.reply_text(execution_guide)
     except Exception:
         logger.exception("Failed to compute peak map")
         await update.message.reply_text(
@@ -851,7 +1361,7 @@ async def handle_peaks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "Bot phân tích vàng XAU/USD.\n"
+        "Bot phân tích Binance Futures XAUUSDT.\n"
         "• /gia hoặc /signal: kịch bản giao dịch đã xác nhận.\n"
         "• /dinh: bản đồ đỉnh cũ/mới, cản trên và hỗ trợ retest."
     )
@@ -861,8 +1371,21 @@ def main() -> None:
     token = os.environ["TELEGRAM_BOT_TOKEN"]
     authorized_chat_id = int(os.environ["TELEGRAM_CHAT_ID"])
     config = load_config()
-    provider = TwelveDataProvider()
-    price_stream = TwelveDataPriceStream(provider.api_key, provider.symbol)
+    market_data_config = config.get("market_data", {})
+    provider = BinanceFuturesProvider(
+        symbol=config.get("symbol", "XAUUSDT"),
+        base_url=market_data_config.get(
+            "base_url",
+            "https://fapi.binance.com",
+        ),
+    )
+    price_stream = BinanceFuturesPriceStream(
+        symbol=provider.symbol,
+        websocket_base_url=market_data_config.get(
+            "websocket_base_url",
+            "wss://fstream.binance.com",
+        ),
+    )
     price_stream.start()
 
     app = Application.builder().token(token).build()

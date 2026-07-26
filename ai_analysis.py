@@ -21,6 +21,12 @@ from market_context import (
     RetestAssessment,
     TimeframeConsensus,
 )
+from peak_analysis import (
+    PeakExecutionPlan,
+    PeakLiquidityAssessment,
+    PeakMap,
+    PeakTradeGate,
+)
 
 
 class AIMarketAnalysis(BaseModel):
@@ -46,6 +52,19 @@ class AIMarketAnalysis(BaseModel):
         ge=0,
         le=100,
         description="Mức nhất quán giữa các nguồn dữ liệu, không phải xác suất thắng.",
+    )
+
+
+class AIPeakReview(BaseModel):
+    decision: Literal["CHỜ", "CANH LONG", "CANH SHORT"]
+    review_vi: str = Field(description="Review vùng đỉnh và bối cảnh đa khung, tối đa 180 ký tự.")
+    confirmation_vi: str = Field(description="Điều kiện nến đóng cần chờ, tối đa 180 ký tự.")
+    invalidation_vi: str = Field(description="Điều kiện vô hiệu dùng đúng vùng code cung cấp, tối đa 160 ký tự.")
+    risk_vi: str = Field(description="Rủi ro quan trọng nhất, tối đa 160 ký tự.")
+    data_consistency: int = Field(
+        ge=0,
+        le=100,
+        description="Độ nhất quán dữ liệu, không phải xác suất thắng.",
     )
 
 
@@ -117,6 +136,7 @@ def build_ai_snapshot(
     resistance_test: ResistanceZoneAnalysis | None = None,
     frames: dict[str, pd.DataFrame] | None = None,
     retest: RetestAssessment | None = None,
+    derivatives_metrics: dict | None = None,
 ) -> dict:
     def candle_payload(frame: pd.DataFrame) -> list[dict]:
         return [
@@ -145,9 +165,10 @@ def build_ai_snapshot(
         }
 
     return {
-        "instrument": "XAU/USD",
+        "instrument": "Binance Futures XAUUSDT perpetual",
         "current_price": round(current_price, 4),
         "quote_source": quote_source,
+        "binance_futures_metrics": derivatives_metrics,
         "deterministic_actionable": plan is not None,
         "deterministic_consensus_score": round(consensus.score, 4),
         "closed_candle_consensus_actionable": consensus.actionable,
@@ -162,14 +183,17 @@ def build_ai_snapshot(
             "score": round(pressure.score, 4),
             "up_bars": pressure.up_bars,
             "down_bars": pressure.down_bars,
-            "note": "Price-action proxy, not centralized XAU order flow.",
+            "taker_buy_notional": pressure.taker_buy_notional,
+            "taker_sell_notional": pressure.taker_sell_notional,
+            "uses_actual_trade_flow": pressure.uses_trade_flow,
+            "note": "Closed Binance XAUUSDT 1m price action plus actual taker flow when available.",
         },
-        "paxg_order_book_proxy": (
+        "binance_xauusdt_order_book": (
             {
                 "score": round(order_book.score, 4),
                 "bid_notional": round(order_book.bid_notional, 2),
                 "ask_notional": round(order_book.ask_notional, 2),
-                "note": "PAXG/USDT proxy; can diverge from XAU/USD and can be spoofed.",
+                "note": "Actual XAUUSDT futures order book; still short-lived and can be spoofed.",
             }
             if order_book
             else None
@@ -198,7 +222,7 @@ def build_ai_snapshot(
                 ),
                 "rejection_score_out_of_6": resistance_test.rejection_score,
                 "verdict": resistance_test.verdict,
-                "note": "Latest candle may still be forming; require a 15m close.",
+                "note": "All supplied candles were filtered to completed bars.",
             }
             if resistance_test is not None
             else None
@@ -235,18 +259,19 @@ def build_ai_snapshot(
 
 
 SYSTEM_PROMPT = """
-Bạn là trợ lý phân tích thị trường XAU/USD, không phải cố vấn tài chính và không được hứa hẹn lợi nhuận.
+Bạn là trợ lý phân tích hợp đồng Binance Futures XAUUSDT perpetual, không phải cố vấn tài chính và không được hứa hẹn lợi nhuận.
 Hãy trả lời hoàn toàn bằng tiếng Việt dựa CHỈ trên ảnh biểu đồ và JSON do ứng dụng cung cấp.
 
 Quy tắc bắt buộc:
 1. Không bịa tin, giá, đỉnh, đáy, chỉ báo, xác suất thắng hoặc dữ liệu order flow.
 2. Tin tức chỉ là tiêu đề; nêu tác động theo điều kiện, không khẳng định quan hệ nhân quả.
-3. PAXG order book chỉ là proxy và có thể bị spoof.
+3. Order book XAUUSDT là dữ liệu hợp đồng thật nhưng ngắn hạn và vẫn có thể bị spoof.
 4. Không tự tạo hay sửa Entry, SL, TP, khối lượng hoặc đòn bẩy. Chỉ nhắc các mức code đã cung cấp.
 5. Nếu deterministic_actionable=false thì stance bắt buộc là ĐỨNG NGOÀI; không được gợi ý vào sớm.
 6. Nếu deterministic_actionable=true, stance chỉ được cùng dấu với deterministic_consensus_score.
 7. data_consistency chỉ đo độ đồng thuận dữ liệu, KHÔNG phải xác suất thắng.
 8. Mỗi trường văn bản tối đa 220 ký tự, cụ thể và tránh lặp lại.
+9. Funding, open interest, order book hoặc basis không được dùng riêng lẻ để kết luận LONG/SHORT.
 """
 
 
@@ -400,5 +425,271 @@ def format_ai_analysis(
             f"• Nguyên nhân: {compact(analysis.momentum_vi + ' ' + analysis.news_context_vi, 180)}",
             f"• Điều kiện: {compact(analysis.primary_scenario_vi, 180)}",
             f"• Vô hiệu/rủi ro: {compact(analysis.alternative_scenario_vi + ' ' + analysis.risk_vi, 200)}",
+        ]
+    )
+
+
+def build_peak_ai_snapshot(
+    peak_map: PeakMap,
+    gate: PeakTradeGate,
+    frames: dict[str, pd.DataFrame],
+    momentum_scores: dict[str, float],
+    derivatives_metrics: dict,
+    execution_plan: PeakExecutionPlan | None = None,
+    execution_reason: str | None = None,
+    liquidity: PeakLiquidityAssessment | None = None,
+    hourly_structure: ChartStructure | None = None,
+) -> dict:
+    def zone_payload(zone) -> dict | None:
+        if zone is None:
+            return None
+        return {
+            "lower": round(zone.lower, 4),
+            "upper": round(zone.upper, 4),
+            "reliability": zone.reliability,
+            "status": zone.status,
+            "timeframes": list(zone.timeframes),
+            "evidence_count": zone.evidence_count,
+            "reaction_atr": round(zone.reaction_atr, 2),
+            "volume_spike": zone.volume_spike,
+        }
+
+    def candles(frame: pd.DataFrame) -> list[dict]:
+        return [
+            {
+                "time": timestamp.isoformat(),
+                "open": round(float(row["open"]), 4),
+                "high": round(float(row["high"]), 4),
+                "low": round(float(row["low"]), 4),
+                "close": round(float(row["close"]), 4),
+                "volume": (
+                    round(float(row["volume"]), 4)
+                    if "volume" in frame.columns
+                    else None
+                ),
+            }
+            for timestamp, row in frame.tail(12).iterrows()
+        ]
+
+    return {
+        "instrument": "Binance Futures XAUUSDT perpetual",
+        "current_price": round(peak_map.current_price, 4),
+        "deterministic_gate": {
+            "allowed_decision": gate.allowed_decision,
+            "reason": gate.reason,
+            "long_retest_confirmed": gate.long_retest_confirmed,
+            "short_rejection_confirmed": gate.short_rejection_confirmed,
+            "multi_timeframe_aligned": gate.multi_timeframe_aligned,
+        },
+        "focus_resistance": zone_payload(gate.resistance),
+        "focus_support": zone_payload(gate.support),
+        "resistance_zones": [
+            zone_payload(zone) for zone in peak_map.resistance_zones[:3]
+        ],
+        "converted_support_zones": [
+            zone_payload(zone)
+            for zone in peak_map.converted_support_zones[:2]
+        ],
+        "momentum_scores_closed_candles": {
+            timeframe: round(score, 4)
+            for timeframe, score in momentum_scores.items()
+        },
+        "binance_derivatives_metrics": derivatives_metrics,
+        "one_hour_structure": (
+            {
+                "trend": hourly_structure.trend,
+                "pattern": hourly_structure.pattern,
+                "support": round(hourly_structure.support, 4),
+                "resistance": round(hourly_structure.resistance, 4),
+            }
+            if hourly_structure is not None
+            else None
+        ),
+        "liquidity_guard": (
+            {
+                "is_weekend": liquidity.is_weekend,
+                "status": liquidity.status,
+                "volume_ratio_vs_weekday_median": (
+                    round(liquidity.volume_ratio, 4)
+                    if liquidity.volume_ratio is not None
+                    else None
+                ),
+                "spread_bps": (
+                    round(liquidity.spread_bps, 4)
+                    if liquidity.spread_bps is not None
+                    else None
+                ),
+                "entries_allowed": liquidity.entries_allowed,
+                "reason": liquidity.reason,
+            }
+            if liquidity is not None
+            else None
+        ),
+        "code_execution_plan": (
+            {
+                "side": execution_plan.side,
+                "entry_zone": [
+                    execution_plan.entry_lower,
+                    execution_plan.entry_upper,
+                ],
+                "entry_reference": execution_plan.entry_reference,
+                "stop_loss": execution_plan.stop_loss,
+                "take_profit_1": execution_plan.take_profit_1,
+                "take_profit_2": execution_plan.take_profit_2,
+                "reward_risk_1": round(execution_plan.reward_risk_1, 2),
+                "reward_risk_2": round(execution_plan.reward_risk_2, 2),
+                "structural_target": execution_plan.structural_target,
+            }
+            if execution_plan is not None
+            else None
+        ),
+        "code_execution_reason": execution_reason,
+        "closed_candles_oldest_to_newest": {
+            timeframe: candles(frame) for timeframe, frame in frames.items()
+        },
+    }
+
+
+PEAK_REVIEW_SYSTEM_PROMPT = """
+Bạn review bản đồ đỉnh Binance Futures XAUUSDT bằng tiếng Việt, thật ngắn và không hứa hẹn lợi nhuận.
+Chỉ dùng JSON do ứng dụng cung cấp.
+
+Quy tắc bắt buộc:
+1. decision không được mạnh hơn deterministic_gate.allowed_decision. Nếu code là CHỜ thì AI bắt buộc CHỜ.
+2. Không tự tạo giá, vùng, Entry, SL, TP, xác suất thắng, đòn bẩy hoặc khối lượng. Chỉ được nhắc mức trong code_execution_plan khi trường này khác null.
+3. Chỉ nhắc các biên vùng có sẵn trong JSON; không khuyên đuổi giá. Nếu code_execution_plan=null thì decision bắt buộc CHỜ và nói rõ chưa được đặt lệnh.
+4. Nêu rõ cần nến 15m đóng xác nhận và retest/từ chối vùng.
+5. Funding, OI, basis, volume và order book không được dùng riêng lẻ để chọn hướng.
+6. Mỗi trường văn bản tối đa 180 ký tự; data_consistency không phải xác suất thắng.
+7. Phải ưu tiên cấu trúc và nến đóng 1H. Nếu liquidity_guard.entries_allowed=false thì decision bắt buộc CHỜ.
+"""
+
+
+def enforce_peak_review_consistency(
+    review: AIPeakReview,
+    snapshot: dict,
+) -> AIPeakReview:
+    allowed = snapshot["deterministic_gate"]["allowed_decision"]
+    liquidity = snapshot.get("liquidity_guard") or {}
+    if (
+        allowed == "CHỜ"
+        or snapshot.get("code_execution_plan") is None
+        or liquidity.get("entries_allowed") is False
+    ):
+        review.decision = "CHỜ"
+    elif allowed == "CANH LONG" and review.decision == "CANH SHORT":
+        review.decision = "CHỜ"
+    elif allowed == "CANH SHORT" and review.decision == "CANH LONG":
+        review.decision = "CHỜ"
+    return review
+
+
+def analyze_peak_with_gemini(
+    api_key: str,
+    model: str,
+    timeout_seconds: int,
+    snapshot: dict,
+) -> AIPeakReview:
+    client = genai.Client(
+        api_key=api_key,
+        http_options=types.HttpOptions(timeout=timeout_seconds * 1000),
+    )
+    prompt = (
+        PEAK_REVIEW_SYSTEM_PROMPT
+        + "\nDữ liệu có cấu trúc:\n"
+        + json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"))
+    )
+    interaction = client.interactions.create(
+        model=model,
+        store=False,
+        input=[{"type": "text", "text": prompt}],
+        response_format={
+            "type": "text",
+            "mime_type": "application/json",
+            "schema": AIPeakReview.model_json_schema(),
+        },
+    )
+    review = AIPeakReview.model_validate_json(interaction.output_text)
+    return enforce_peak_review_consistency(review, snapshot)
+
+
+def analyze_peak_with_groq(
+    api_key: str,
+    model: str,
+    timeout_seconds: int,
+    snapshot: dict,
+) -> AIPeakReview:
+    template = {
+        "decision": "CHỜ | CANH LONG | CANH SHORT",
+        "review_vi": "tối đa 180 ký tự",
+        "confirmation_vi": "tối đa 180 ký tự",
+        "invalidation_vi": "tối đa 160 ký tự",
+        "risk_vi": "tối đa 160 ký tự",
+        "data_consistency": "số nguyên 0..100",
+    }
+    prompt = (
+        PEAK_REVIEW_SYSTEM_PROMPT
+        + "\nKhông dùng Markdown; chỉ trả một JSON object đủ các khóa sau:\n"
+        + json.dumps(template, ensure_ascii=False, separators=(",", ":"))
+        + "\nDữ liệu có cấu trúc:\n"
+        + json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"))
+    )
+    response = requests.post(
+        "https://api.groq.com/openai/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "reasoning_effort": "none",
+            "temperature": 0.2,
+            "top_p": 0.8,
+            "max_completion_tokens": 500,
+            "response_format": {"type": "json_object"},
+            "stream": False,
+        },
+        timeout=timeout_seconds,
+    )
+    if not response.ok:
+        raise RuntimeError(f"Groq HTTP {response.status_code}: {response.text[:500]}")
+    try:
+        content = response.json()["choices"][0]["message"]["content"]
+    except (ValueError, KeyError, IndexError, TypeError) as exc:
+        raise RuntimeError("Groq returned an invalid peak review payload") from exc
+    review = AIPeakReview.model_validate_json(content)
+    return enforce_peak_review_consistency(review, snapshot)
+
+
+def format_peak_ai_review(
+    review: AIPeakReview,
+    model: str,
+    gate: PeakTradeGate,
+) -> str:
+    def compact(value: str, limit: int) -> str:
+        value = " ".join(value.split())
+        return value if len(value) <= limit else value[: limit - 1].rstrip() + "…"
+
+    resistance_text = (
+        f"R {gate.resistance.lower:.2f}–{gate.resistance.upper:.2f}"
+        if gate.resistance is not None
+        else "R chưa xác định"
+    )
+    support_text = (
+        f"S {gate.support.lower:.2f}–{gate.support.upper:.2f}"
+        if gate.support is not None
+        else "S chưa xác định"
+    )
+
+    return "\n".join(
+        [
+            f"🤖 AI REVIEW ĐỈNH — {model}",
+            f"• Kết luận: {review.decision} · đồng thuận {review.data_consistency}/100 (không phải xác suất).",
+            f"• Vùng code: {resistance_text} · {support_text}.",
+            f"• Bộ lọc code: {compact(gate.reason, 180)}",
+            f"• Review: {compact(review.review_vi, 180)}",
+            f"• Xác nhận: {compact(review.confirmation_vi, 180)}",
+            f"• Vô hiệu/rủi ro: {compact(review.invalidation_vi + ' ' + review.risk_vi, 200)}",
         ]
     )

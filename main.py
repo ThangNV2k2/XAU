@@ -2,15 +2,16 @@ import argparse
 import json
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 
 import yaml
 from apscheduler.schedulers.blocking import BlockingScheduler
 from dotenv import load_dotenv
 
 from alerting.telegram_bot import TelegramAlerter
-from data_provider.twelvedata_provider import TwelveDataProvider
+from data_provider.binance_futures_provider import BinanceFuturesProvider
 from indicators.signal_engine import SignalResult, compute_signal
+from market_context import select_closed_candles
 
 load_dotenv()
 
@@ -30,7 +31,7 @@ def load_config(path: str = "config.yaml") -> dict:
 
 def format_alert(result: SignalResult) -> str:
     lines = [
-        f"*XAU/USD Signal: {result.signal}*",
+        f"*Binance XAUUSDT PERP Signal: {result.signal}*",
         f"Price: {result.price:.2f}",
         f"Weighted score: {result.weighted_score:.2f}",
         f"ATR(14): {result.atr:.2f} | Suggested stop distance: {result.suggested_stop_distance:.2f}",
@@ -44,13 +45,21 @@ def format_alert(result: SignalResult) -> str:
 
 
 def run_once(
-    provider: TwelveDataProvider,
+    provider: BinanceFuturesProvider,
     config: dict,
     alerter: TelegramAlerter | None,
     dry_run: bool,
     last_signal: dict,
 ) -> None:
-    df = provider.get_historical(interval=config["live"]["interval"], outputsize=config["live"]["outputsize"])
+    interval = config["live"]["interval"]
+    df = select_closed_candles(
+        provider.get_historical(
+            interval=interval,
+            outputsize=config["live"]["outputsize"],
+        ),
+        interval,
+        datetime.now(timezone.utc),
+    )
     weights = config["weights"]
     thresholds = {"buy": config["threshold_buy"], "sell": config["threshold_sell"]}
     result = compute_signal(df, weights, thresholds, atr_stop_multiplier=config.get("atr_stop_multiplier", 1.5))
@@ -69,7 +78,7 @@ def run_once(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Gold XAU/USD signal polling bot")
+    parser = argparse.ArgumentParser(description="Binance Futures XAUUSDT signal polling bot")
     parser.add_argument("--once", action="store_true", help="Run a single check and exit (no scheduler, no Telegram)")
     parser.add_argument(
         "--dry-run",
@@ -79,7 +88,11 @@ def main() -> None:
     args = parser.parse_args()
 
     config = load_config()
-    provider = TwelveDataProvider()
+    market_data_config = config.get("market_data", {})
+    provider = BinanceFuturesProvider(
+        symbol=config.get("symbol", "XAUUSDT"),
+        base_url=market_data_config.get("base_url", "https://fapi.binance.com"),
+    )
     last_signal: dict = {}
 
     if args.once:

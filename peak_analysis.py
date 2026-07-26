@@ -1,6 +1,11 @@
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from io import BytesIO
+from zoneinfo import ZoneInfo
 
+import matplotlib.pyplot as plt
 import pandas as pd
+from ta.trend import EMAIndicator
 from ta.volatility import AverageTrueRange
 
 
@@ -64,6 +69,45 @@ class PeakMap:
     converted_support_zones: list[PeakZone]
     volume_available: bool
     scanned_peak_count: int
+
+
+@dataclass
+class PeakTradeGate:
+    allowed_decision: str
+    reason: str
+    resistance: PeakZone | None
+    support: PeakZone | None
+    long_retest_confirmed: bool
+    short_rejection_confirmed: bool
+    multi_timeframe_aligned: bool
+    hourly_confirmed: bool = False
+    liquidity_confirmed: bool = True
+
+
+@dataclass
+class PeakExecutionPlan:
+    side: str
+    entry_lower: float
+    entry_upper: float
+    entry_reference: float
+    stop_loss: float
+    take_profit_1: float
+    take_profit_2: float
+    reward_risk_1: float
+    reward_risk_2: float
+    structural_target: str
+
+
+@dataclass
+class PeakLiquidityAssessment:
+    is_weekend: bool
+    status: str
+    recent_hourly_volume: float | None
+    weekday_baseline_volume: float | None
+    volume_ratio: float | None
+    spread_bps: float | None
+    entries_allowed: bool
+    reason: str
 
 
 def find_confirmed_fractals(
@@ -407,6 +451,519 @@ def build_peak_map(
     )
 
 
+def assess_peak_liquidity(
+    frame_1h: pd.DataFrame,
+    current_price: float,
+    bid_price: float | None,
+    ask_price: float | None,
+    analysis_now: datetime | None = None,
+    settings: dict | None = None,
+) -> PeakLiquidityAssessment:
+    """Compare recent XAUUSDT volume with its weekday baseline and guard weekends."""
+    settings = settings or {}
+    analysis_now = analysis_now or datetime.now(timezone.utc)
+    if analysis_now.tzinfo is None:
+        analysis_now = analysis_now.replace(tzinfo=timezone.utc)
+    local_now = analysis_now.astimezone(ZoneInfo("Asia/Bangkok"))
+    is_weekend = local_now.weekday() >= 5
+
+    volume_column = (
+        "quote_volume"
+        if "quote_volume" in frame_1h.columns
+        else "volume"
+        if "volume" in frame_1h.columns
+        else None
+    )
+    recent_volume = None
+    baseline_volume = None
+    volume_ratio = None
+    if volume_column is not None:
+        volumes = pd.to_numeric(frame_1h[volume_column], errors="coerce").dropna()
+        recent_bars = max(3, int(settings.get("recent_volume_hours", 6)))
+        recent = volumes.tail(recent_bars)
+        prior = volumes.iloc[: -recent_bars].tail(
+            max(24, int(settings.get("volume_baseline_hours", 168)))
+        )
+        if not prior.empty:
+            weekday_prior = prior[prior.index.dayofweek < 5]
+            baseline_source = weekday_prior if len(weekday_prior) >= 12 else prior
+            recent_volume = float(recent.median()) if not recent.empty else None
+            baseline_volume = float(baseline_source.median())
+            if recent_volume is not None and baseline_volume > 0:
+                volume_ratio = recent_volume / baseline_volume
+
+    spread_bps = None
+    if (
+        bid_price is not None
+        and ask_price is not None
+        and ask_price >= bid_price
+        and current_price > 0
+    ):
+        spread_bps = (ask_price - bid_price) / current_price * 10_000
+
+    minimum_volume_ratio = max(
+        0.0,
+        float(settings.get("minimum_volume_ratio", 0.45)),
+    )
+    maximum_spread_bps = max(
+        0.0,
+        float(settings.get("maximum_spread_bps", 3.0)),
+    )
+    block_weekend = bool(settings.get("block_weekend_entries", True))
+
+    if is_weekend and block_weekend:
+        entries_allowed = False
+        status = "THẤP / CUỐI TUẦN"
+        ratio_text = (
+            f"; volume 1H gần đây bằng {volume_ratio:.0%} median ngày thường"
+            if volume_ratio is not None
+            else ""
+        )
+        reason = (
+            "Cuối tuần: thị trường tham chiếu truyền thống nghỉ, bot chỉ vẽ vùng "
+            f"và không phát Entry{ratio_text}."
+        )
+    elif volume_ratio is not None and volume_ratio < minimum_volume_ratio:
+        entries_allowed = False
+        status = "THẤP"
+        reason = (
+            f"Thanh khoản 1H chỉ bằng {volume_ratio:.0%} median ngày thường, "
+            "không đủ để xác nhận phá/retest."
+        )
+    elif spread_bps is not None and spread_bps > maximum_spread_bps:
+        entries_allowed = False
+        status = "SPREAD RỘNG"
+        reason = (
+            f"Spread {spread_bps:.2f} bps vượt ngưỡng {maximum_spread_bps:.2f} bps."
+        )
+    else:
+        entries_allowed = True
+        status = "TỐT" if volume_ratio is not None and volume_ratio >= 0.8 else "BÌNH THƯỜNG"
+        ratio_text = (
+            f"Volume 1H bằng {volume_ratio:.0%} median ngày thường."
+            if volume_ratio is not None
+            else "Chưa đủ lịch sử để so volume ngày thường."
+        )
+        reason = ratio_text
+
+    return PeakLiquidityAssessment(
+        is_weekend=is_weekend,
+        status=status,
+        recent_hourly_volume=recent_volume,
+        weekday_baseline_volume=baseline_volume,
+        volume_ratio=volume_ratio,
+        spread_bps=spread_bps,
+        entries_allowed=entries_allowed,
+        reason=reason,
+    )
+
+
+def assess_peak_trade_gate(
+    peak_map: PeakMap,
+    frame_15m: pd.DataFrame,
+    momentum_scores: dict[str, float],
+    settings: dict | None = None,
+    frame_1h: pd.DataFrame | None = None,
+    liquidity: PeakLiquidityAssessment | None = None,
+) -> PeakTradeGate:
+    """Allow a directional AI review only after closed-bar structural confirmation."""
+    settings = settings or {}
+    resistance = peak_map.resistance_zones[0] if peak_map.resistance_zones else None
+    support = (
+        peak_map.converted_support_zones[0]
+        if peak_map.converted_support_zones
+        else None
+    )
+    if resistance is None:
+        return PeakTradeGate(
+            "CHỜ",
+            "Không có vùng cản trên đã xác nhận đủ gần.",
+            None,
+            support,
+            False,
+            False,
+            False,
+        )
+
+    recent = frame_15m.tail(max(4, int(settings.get("ai_review_bars", 8))))
+    atr = max(float(_atr_series(frame_15m).iloc[-1]), peak_map.current_price * 0.0001)
+    tolerance = max(atr * 0.15, peak_map.current_price * 0.0001)
+
+    breakout_at = None
+    for position in range(1, len(recent)):
+        if (
+            float(recent["close"].iloc[position - 1]) <= resistance.upper
+            and float(recent["close"].iloc[position]) > resistance.upper
+        ):
+            breakout_at = position
+    long_retest = False
+    if breakout_at is not None and breakout_at + 1 < len(recent):
+        after_breakout = recent.iloc[breakout_at + 1 :]
+        long_retest = bool(
+            (
+                (after_breakout["low"] <= resistance.upper + tolerance)
+                & (after_breakout["low"] >= resistance.lower - tolerance)
+                & (after_breakout["close"] > resistance.upper)
+            ).any()
+        )
+
+    latest_two = recent.tail(2)
+    candle_range = (latest_two["high"] - latest_two["low"]).clip(lower=1e-9)
+    body = (latest_two["close"] - latest_two["open"]).abs()
+    upper_wick = latest_two["high"] - latest_two[["open", "close"]].max(axis=1)
+    touched = (latest_two["high"] >= resistance.lower) & (
+        latest_two["low"] <= resistance.upper
+    )
+    short_rejection = bool(
+        (
+            touched
+            & (latest_two["close"] < resistance.lower)
+            & (latest_two["close"] < latest_two["open"])
+            & ((upper_wick >= body) | (body / candle_range >= 0.55))
+        ).any()
+    )
+
+    required = ("15min", "1h", "4h")
+    minimum_score = float(settings.get("minimum_timeframe_score", 0.12))
+    long_aligned = all(
+        momentum_scores.get(timeframe, 0.0) >= minimum_score
+        for timeframe in required
+    )
+    short_aligned = all(
+        momentum_scores.get(timeframe, 0.0) <= -minimum_score
+        for timeframe in required
+    )
+    current_near_resistance = (
+        resistance.lower - atr * 0.30
+        <= peak_map.current_price
+        <= resistance.upper + atr * 0.30
+    )
+
+    require_hourly_close = bool(
+        settings.get("require_1h_close_confirmation", True)
+    )
+    if frame_1h is not None and not frame_1h.empty:
+        hourly_latest = frame_1h.iloc[-1]
+        hourly_recent = frame_1h.tail(2)
+        hourly_long_confirmed = float(hourly_latest["close"]) > resistance.upper
+        hourly_short_confirmed = bool(
+            float(hourly_latest["close"]) < resistance.lower
+            and float(hourly_latest["close"]) < float(hourly_latest["open"])
+            and (hourly_recent["high"] >= resistance.lower).any()
+        )
+    else:
+        hourly_long_confirmed = not require_hourly_close
+        hourly_short_confirmed = not require_hourly_close
+    liquidity_confirmed = liquidity is None or liquidity.entries_allowed
+
+    if (
+        long_retest
+        and long_aligned
+        and hourly_long_confirmed
+        and liquidity_confirmed
+        and current_near_resistance
+    ):
+        return PeakTradeGate(
+            "CANH LONG",
+            "Ba khung cùng tăng; 15m phá/retest giữ cản và nến 1H đóng xác nhận.",
+            resistance,
+            support,
+            True,
+            short_rejection,
+            True,
+            True,
+            True,
+        )
+    if (
+        short_rejection
+        and short_aligned
+        and hourly_short_confirmed
+        and liquidity_confirmed
+        and current_near_resistance
+    ):
+        return PeakTradeGate(
+            "CANH SHORT",
+            "Ba khung cùng giảm; 15m từ chối cản và nến 1H đóng xác nhận.",
+            resistance,
+            support,
+            long_retest,
+            True,
+            True,
+            True,
+            True,
+        )
+
+    if not liquidity_confirmed:
+        reason = liquidity.reason
+    elif not (long_aligned or short_aligned):
+        reason = "Ba khung 15m/1H/4H chưa đồng thuận cùng hướng."
+    elif long_aligned and not long_retest:
+        reason = "Động lượng nghiêng tăng nhưng chưa có breakout và retest 15m hợp lệ."
+    elif long_aligned and require_hourly_close and not hourly_long_confirmed:
+        reason = f"15m đã nghiêng LONG nhưng nến 1H chưa đóng trên {resistance.upper:.2f}."
+    elif short_aligned and not short_rejection:
+        reason = "Động lượng nghiêng giảm nhưng chưa có nến 15m từ chối cản hợp lệ."
+    elif short_aligned and require_hourly_close and not hourly_short_confirmed:
+        reason = f"15m đã nghiêng SHORT nhưng nến 1H chưa đóng từ chối dưới {resistance.lower:.2f}."
+    else:
+        reason = "Xác nhận có nhưng giá hiện đã rời vùng, không đuổi giá."
+    return PeakTradeGate(
+        "CHỜ",
+        reason,
+        resistance,
+        support,
+        long_retest,
+        short_rejection,
+        long_aligned or short_aligned,
+        (
+            hourly_long_confirmed
+            if long_aligned
+            else hourly_short_confirmed
+            if short_aligned
+            else False
+        ),
+        liquidity_confirmed,
+    )
+
+
+def build_peak_execution_plan(
+    peak_map: PeakMap,
+    gate: PeakTradeGate,
+    frame_15m: pd.DataFrame,
+    settings: dict | None = None,
+) -> tuple[PeakExecutionPlan | None, str]:
+    """Build levels only for a code-confirmed setup with a viable structural target."""
+    settings = settings or {}
+    if gate.allowed_decision not in ("CANH LONG", "CANH SHORT"):
+        return None, gate.reason
+    if gate.resistance is None:
+        return None, "Không có vùng cản gốc để tính điểm vô hiệu."
+
+    tick = max(float(settings.get("price_tick", 0.01)), 1e-9)
+    atr = max(float(_atr_series(frame_15m).iloc[-1]), peak_map.current_price * 0.0001)
+    entry_padding = max(
+        atr * float(settings.get("entry_buffer_atr", 0.15)),
+        tick,
+    )
+    stop_padding = max(
+        atr * float(settings.get("stop_buffer_atr", 0.20)),
+        tick * 2,
+    )
+    minimum_structural_rr = max(
+        1.0,
+        float(settings.get("minimum_structural_rr", 1.5)),
+    )
+    tp1_r = max(0.5, float(settings.get("take_profit_1_r", 1.0)))
+    resistance = gate.resistance
+
+    def rounded(value: float) -> float:
+        return round(value / tick) * tick
+
+    if gate.allowed_decision == "CANH LONG":
+        side = "LONG"
+        entry_lower = rounded(resistance.upper)
+        entry_upper = rounded(resistance.upper + entry_padding)
+        stop_loss = rounded(resistance.lower - stop_padding)
+        higher_resistance = sorted(
+            (
+                zone
+                for zone in peak_map.resistance_zones
+                if zone.lower > entry_upper + tick
+            ),
+            key=lambda zone: zone.lower,
+        )
+        if not higher_resistance:
+            return None, "Không có cản trên kế tiếp để đặt TP cấu trúc an toàn."
+        target_zone = higher_resistance[0]
+        take_profit_2 = rounded(target_zone.lower)
+        structural_target = (
+            f"cản kế tiếp {target_zone.lower:.2f}–{target_zone.upper:.2f}"
+        )
+        direction = 1
+    else:
+        side = "SHORT"
+        entry_lower = rounded(resistance.lower - entry_padding)
+        entry_upper = rounded(resistance.lower)
+        stop_loss = rounded(resistance.upper + stop_padding)
+        lower_support = sorted(
+            (
+                zone
+                for zone in peak_map.converted_support_zones
+                if zone.upper < entry_lower - tick
+            ),
+            key=lambda zone: zone.upper,
+            reverse=True,
+        )
+        if not lower_support:
+            return None, "Không có hỗ trợ phía dưới để đặt TP cấu trúc an toàn."
+        target_zone = lower_support[0]
+        take_profit_2 = rounded(target_zone.upper)
+        structural_target = (
+            f"hỗ trợ kế tiếp {target_zone.lower:.2f}–{target_zone.upper:.2f}"
+        )
+        direction = -1
+
+    entry_reference = rounded((entry_lower + entry_upper) / 2)
+    risk_distance = direction * (entry_reference - stop_loss)
+    reward_2 = direction * (take_profit_2 - entry_reference)
+    if risk_distance <= 0 or reward_2 <= 0:
+        return None, "Vùng Entry/SL/TP không đúng thứ tự giá; bỏ thiết lập này."
+
+    reward_risk_2 = reward_2 / risk_distance
+    if reward_risk_2 < minimum_structural_rr:
+        return (
+            None,
+            f"Bỏ lệnh: mục tiêu cấu trúc chỉ đạt R:R {reward_risk_2:.2f}, "
+            f"thấp hơn {minimum_structural_rr:.2f}.",
+        )
+
+    take_profit_1 = rounded(
+        entry_reference + direction * risk_distance * tp1_r
+    )
+    reward_risk_1 = (
+        direction * (take_profit_1 - entry_reference) / risk_distance
+    )
+    if direction * (take_profit_2 - take_profit_1) <= 0:
+        return None, "TP cấu trúc nằm trước TP1; tỷ lệ lời/lỗ không đủ để vào."
+
+    return (
+        PeakExecutionPlan(
+            side=side,
+            entry_lower=min(entry_lower, entry_upper),
+            entry_upper=max(entry_lower, entry_upper),
+            entry_reference=entry_reference,
+            stop_loss=stop_loss,
+            take_profit_1=take_profit_1,
+            take_profit_2=take_profit_2,
+            reward_risk_1=reward_risk_1,
+            reward_risk_2=reward_risk_2,
+            structural_target=structural_target,
+        ),
+        "Thiết lập đã qua xác nhận nến đóng và bộ lọc R:R cấu trúc.",
+    )
+
+
+def render_peak_hourly_chart(
+    frame_1h: pd.DataFrame,
+    peak_map: PeakMap,
+    liquidity: PeakLiquidityAssessment | None = None,
+) -> BytesIO:
+    """Render a dedicated closed-candle 1H chart with peak zones and real volume."""
+    data = frame_1h.tail(72).copy()
+    if len(data) < 5:
+        raise ValueError("Need at least 5 closed 1H candles to render peak chart")
+
+    fig, (price_ax, volume_ax) = plt.subplots(
+        2,
+        1,
+        figsize=(10, 7),
+        sharex=True,
+        gridspec_kw={"height_ratios": [4, 1]},
+    )
+    fig.patch.set_facecolor("#10151d")
+    price_ax.set_facecolor("#10151d")
+    volume_ax.set_facecolor("#10151d")
+    width = 0.62
+    candle_colors = []
+    for x, (_, row) in enumerate(data.iterrows()):
+        color = "#26a69a" if row["close"] >= row["open"] else "#ef5350"
+        candle_colors.append(color)
+        price_ax.vlines(x, row["low"], row["high"], color=color, linewidth=0.8)
+        bottom = min(row["open"], row["close"])
+        height = max(abs(row["close"] - row["open"]), peak_map.current_price * 0.000005)
+        price_ax.add_patch(
+            plt.Rectangle(
+                (x - width / 2, bottom),
+                width,
+                height,
+                color=color,
+                alpha=0.92,
+            )
+        )
+
+    ema9 = EMAIndicator(data["close"], window=9).ema_indicator()
+    ema21 = EMAIndicator(data["close"], window=21).ema_indicator()
+    price_ax.plot(range(len(data)), ema9, color="#ffd166", linewidth=1, label="EMA9")
+    price_ax.plot(range(len(data)), ema21, color="#4cc9f0", linewidth=1, label="EMA21")
+    for index, zone in enumerate(peak_map.resistance_zones[:3]):
+        price_ax.axhspan(
+            zone.lower,
+            zone.upper,
+            color="#ff8c42",
+            alpha=0.14,
+            label="Kháng cự" if index == 0 else None,
+        )
+    for index, zone in enumerate(peak_map.converted_support_zones[:2]):
+        price_ax.axhspan(
+            zone.lower,
+            zone.upper,
+            color="#43aa8b",
+            alpha=0.14,
+            label="Hỗ trợ retest" if index == 0 else None,
+        )
+    price_ax.axhline(
+        peak_map.current_price,
+        color="#f8f9fa",
+        linestyle="-.",
+        linewidth=0.9,
+        label=f"Live {peak_map.current_price:.2f}",
+    )
+
+    volume_column = "quote_volume" if "quote_volume" in data.columns else "volume"
+    volume_values = pd.to_numeric(data[volume_column], errors="coerce").fillna(0)
+    volume_ax.bar(range(len(data)), volume_values, color=candle_colors, alpha=0.7, width=0.7)
+    baseline = volume_values.rolling(20, min_periods=5).median()
+    volume_ax.plot(range(len(data)), baseline, color="#ffd166", linewidth=0.8, label="Median Vol20")
+    volume_ax.set_ylabel("Volume", color="#aab2bf", fontsize=8)
+
+    tick_count = min(7, len(data))
+    ticks = [
+        round(i * (len(data) - 1) / max(1, tick_count - 1))
+        for i in range(tick_count)
+    ]
+    volume_ax.set_xticks(ticks)
+    volume_ax.set_xticklabels(
+        [
+            data.index[i].tz_convert("Asia/Bangkok").strftime("%d/%m %H:%M")
+            for i in ticks
+        ],
+        color="#aab2bf",
+        fontsize=8,
+    )
+    for ax in (price_ax, volume_ax):
+        ax.tick_params(axis="y", colors="#aab2bf", labelsize=8)
+        for spine in ax.spines.values():
+            spine.set_color("#334155")
+        ax.grid(alpha=0.10)
+    price_ax.legend(
+        loc="upper left",
+        ncol=5,
+        fontsize=7,
+        facecolor="#18212f",
+        labelcolor="white",
+    )
+    volume_ax.legend(
+        loc="upper left",
+        fontsize=7,
+        facecolor="#18212f",
+        labelcolor="white",
+    )
+    liquidity_text = f" · thanh khoản {liquidity.status}" if liquidity is not None else ""
+    price_ax.set_title(
+        f"Binance XAUUSDT · 1H nến đã đóng{liquidity_text}",
+        color="white",
+        fontsize=12,
+        loc="left",
+    )
+    fig.tight_layout()
+    output = BytesIO()
+    output.name = "xauusdt_peak_1h.png"
+    fig.savefig(output, format="png", dpi=100, facecolor=fig.get_facecolor())
+    plt.close(fig)
+    output.seek(0)
+    return output
+
+
 def format_peak_map(
     peak_map: PeakMap,
     settings: dict | None = None,
@@ -462,7 +1019,7 @@ def format_peak_map(
         )
 
     lines = [
-        f"⛰ *BẢN ĐỒ ĐỈNH XAU/USD {peak_map.current_price:.2f}*",
+        f"⛰ *BẢN ĐỒ ĐỈNH BINANCE XAUUSDT {peak_map.current_price:.2f}*",
         "",
         "*CẢN TRÊN / ĐỈNH ĐANG TEST*",
     ]
@@ -495,7 +1052,7 @@ def format_peak_map(
     lines.append(
         "• Volume: có dữ liệu thật và được cộng điểm khi ≥1.5x trung bình."
         if peak_map.volume_available
-        else "• Volume: XAU/USD nguồn hiện tại không có volume đáng tin nên không cộng điểm."
+        else "• Volume: nguồn hiện tại không có volume hợp lệ nên không cộng điểm."
     )
     lines.append(
         "_Uy tín là điểm hội tụ cấu trúc, không phải xác suất thắng; "

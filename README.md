@@ -1,6 +1,6 @@
-# Gold Signal Tool (XAU/USD)
+# Binance Futures Gold Signal Tool (XAUUSDT)
 
-Bot phân tích kỹ thuật cho XAU/USD, sinh tín hiệu **BUY / SELL / HOLD** từ tổng hợp có trọng số của RSI, MACD, EMA crossover và Bollinger Bands, kèm backtest và cảnh báo qua Telegram.
+Bot phân tích kỹ thuật cho hợp đồng **Binance Futures XAUUSDT perpetual**, sinh tín hiệu từ nến, volume, order book, Mark/Index Price và dữ liệu phái sinh của đúng hợp đồng đang giao dịch.
 
 > **Disclaimer:** Đây là công cụ hỗ trợ phân tích kỹ thuật, **KHÔNG phải dự đoán chắc chắn** và không phải lời khuyên đầu tư. Không có gì đảm bảo lợi nhuận. Giao dịch future dùng đòn bẩy cao — rủi ro mất vốn rất lớn. Không tự động hoá đặt lệnh dựa hoàn toàn vào tín hiệu này mà không kiểm tra thủ công và tự chịu trách nhiệm về quyết định giao dịch của mình.
 
@@ -12,14 +12,15 @@ cp .env.example .env
 ```
 
 Điền vào `.env`:
-- `TWELVEDATA_API_KEY` — đăng ký free tại [twelvedata.com](https://twelvedata.com) (free tier: 800 request/ngày, 8 request/phút — đủ dùng cho polling 15 phút/lần).
+- Dữ liệu live Binance Futures là public nên **không cần Binance API key**; bot không có quyền đặt lệnh hay đọc tài khoản.
+- `TWELVEDATA_API_KEY` — chỉ còn dùng cho backtest XAU/USD tham chiếu ở mục 2, không tham gia Entry/SL live Binance.
 - `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` — chưa cần ngay, chỉ cần khi bật alerting thật (xem bước 4).
 - `GROQ_API_KEY` — AI chính đọc biểu đồ bằng `qwen/qwen3.6-27b`; tạo khóa tại [Groq Console](https://console.groq.com/keys).
 - `GEMINI_API_KEY` — không bắt buộc; dùng làm AI dự phòng khi Groq lỗi hoặc đạt giới hạn.
 
 ## 2. Chạy backtest TRƯỚC KHI dùng thật
 
-Đây là bước bắt buộc để biết cấu hình chỉ báo hiện tại có đáng tin hay không:
+Backtest cũ dùng XAU/USD Twelve Data để tham khảo hành vi chỉ báo:
 
 ```bash
 python run_backtest.py --interval 4h --years 2
@@ -29,7 +30,7 @@ Kết quả in ra: `total_trades`, `win_rate`, `profit_factor`, `max_drawdown`, 
 
 Lần chạy đầu sẽ tải dữ liệu lịch sử từ Twelve Data (tốn vài request) rồi cache ra `backtest/cache/*.csv`. Lần sau sẽ đọc từ cache, dùng `--force-refresh` nếu muốn tải lại.
 
-**Nguyên tắc quan trọng:** nếu `win_rate < 50-55%` hoặc `max_drawdown` quá lớn so với `net_pnl`, KHÔNG bật alerting thật — quay lại chỉnh `weights` / `threshold_buy` / `threshold_sell` trong `config.yaml` (hoặc thử interval khác) rồi backtest lại.
+**Giới hạn:** kết quả XAU/USD không chứng minh edge cho hợp đồng XAUUSDT mới trên Binance. Chỉ xem đây là kiểm tra logic; muốn đánh giá chiến lược live phải backtest lại bằng lịch sử Binance từ ngày hợp đồng được niêm yết.
 
 ## 3. Kiểm tra tín hiệu live (chưa gửi Telegram)
 
@@ -52,8 +53,10 @@ Thay vì tự poll và đẩy tin (main.py), cách chính để dùng tool là *
    python telegram_query_bot.py
    ```
 6. Trong Telegram, nhắn `/signal` hoặc `/gia` cho bot → nhận ngay:
-   - Giá và trạng thái nguồn (`LIVE`, `DỮ LIỆU TRỄ` hoặc `ĐÓNG CỬA`), không giả dữ liệu cuối phiên là realtime.
-   - Một biểu đồ gộp **15m / 1H / 4H**; dữ liệu Twelve Data được yêu cầu ở UTC và chỉ nến đã đóng mới được dùng để xác nhận.
+   - Giá bid/ask realtime từ Binance WebSocket; Last, Mark, Index, funding và open interest từ public Futures API.
+   - Entry/vùng giá dựa trên nến giao dịch XAUUSDT; Mark Price dùng để theo dõi rủi ro PnL chưa thực hiện/thanh lý; Index và basis dùng để phát hiện lệch giá.
+   - Một biểu đồ gộp **15m / 1H / 4H** từ Binance Futures, chỉ dùng nến đã đóng để xác nhận.
+   - Volume và order book thật của XAUUSDT, không còn dùng PAXG làm proxy.
    - Vùng hỗ trợ/kháng cự động từ swing-high, swing-low đa khung và ATR. Hai vùng được tách rời; vùng nhiễu không được dùng làm entry.
    - Trạng thái breakout/breakdown và retest. Bot chỉ lập Entry/SL/TP/khối lượng/đòn bẩy khi đủ chuỗi: ba khung đồng thuận → nến 15m đóng phá vùng → nến sau retest xác nhận → tín hiệu backtest gần đây cùng hướng → giá hiện vẫn ở vùng vào.
    - Phân tích AI mới từ Groq, tự chuyển sang Gemini nếu cần. Luồng `/gia` không tái sử dụng cache AI hoặc cache tin tức.
@@ -64,10 +67,14 @@ Thay vì tự poll và đẩy tin (main.py), cách chính để dùng tool là *
    - Lọc nhiễu bằng ZigZag với deviation riêng cho từng khung; điểm ZigZag cuối chưa có swing ngược xác nhận không được cộng uy tín.
    - Gom các đỉnh gần nhau thành vùng, phân biệt đỉnh cũ/mới và chấm uy tín theo khung, số đỉnh hội tụ, phản ứng sau đỉnh và volume nếu nguồn thực sự có.
    - Đỉnh nằm trên giá được trình bày như cản; đỉnh cũ đã được nến 15m đóng vượt được trình bày riêng như hỗ trợ retest tiềm năng.
+   - Sau bản đồ, AI review ngắn theo nến đóng và dữ liệu phái sinh hiện tại. Code khóa kết luận ở `CHỜ`, `CANH LONG` hoặc `CANH SHORT`; AI không được đảo hướng, tự tạo mốc giá hay Entry/SL/TP.
+   - `CANH LONG` chỉ được mở khi ba khung cùng tăng, 15m đã đóng phá cản và một nến sau retest giữ được. `CANH SHORT` cần ba khung cùng giảm và 15m đóng từ chối cản. Thiếu một điều kiện thì kết luận là `CHỜ`.
+   - Khi đã xác nhận, code mới tính vùng Entry retest, SL ngoài vùng theo ATR, TP1 ở 1R và TP2 tại cản/hỗ trợ cấu trúc kế tiếp. Nếu TP2 không đạt tối thiểu 1.5R thì bot ghi `KHÔNG VÀO`.
+   - Kế hoạch kèm khối lượng theo rủi ro tài khoản, đòn bẩy isolated, cách chốt 50% tại TP1, dời SL về Entry và time-stop. Khi chưa xác nhận, `/dinh` chỉ đưa mốc cần chờ và yêu cầu gọi lại sau nến 15m đóng.
 
    Chỉ chat có `chat_id` khớp trong `.env` mới được bot trả lời (người khác nhắn bot sẽ bị bỏ qua, tránh lộ và tốn quota API).
 
-**Quan trọng:** hỗ trợ/kháng cự và retest chỉ làm giảm việc đuổi giá, không biến tín hiệu thành dự đoán chắc chắn. Kết quả backtest gần nhất vẫn **chưa có edge ổn định** (win rate ~47%, profit factor ~0.5, xem mục 2). Không dùng riêng bot hoặc AI làm căn cứ vào lệnh đòn bẩy.
+**Quan trọng:** hỗ trợ/kháng cự và retest chỉ làm giảm việc đuổi giá, không biến tín hiệu thành dự đoán chắc chắn. Dữ liệu đúng sàn loại bỏ sai lệch nguồn nhưng không tạo ra edge; không dùng riêng bot hoặc AI làm căn cứ vào lệnh đòn bẩy.
 
 ### (Tuỳ chọn) Cách cũ: bot tự poll và đẩy tin khi tín hiệu đổi
 
@@ -82,18 +89,21 @@ python main.py             # chạy thật, đẩy tin khi tín hiệu đổi tr
 - `threshold_buy` / `threshold_sell` — ngưỡng điểm để ra tín hiệu BUY/SELL (chỉ áp dụng cho tín hiệu backtest, không áp dụng cho bias liên tục).
 - `atr_stop_multiplier` — hệ số nhân ATR(14) để gợi ý khoảng cách stop-loss (không ảnh hưởng tín hiệu hướng).
 - `live.interval` / `live.poll_minutes` / `live.outputsize` — khung nến và tần suất polling khi chạy live.
+- `market_data` — endpoint REST/WebSocket public của Binance Futures.
+- `order_book` — depth thật của XAUUSDT.
 - `signal_confirmation` — ngưỡng đồng thuận ba khung, số nến tìm retest, độ rộng vùng retest và số nến tìm tín hiệu backtest xác nhận.
 - `resistance_test` — độ gom cụm swing theo ATR, độ rộng vùng và các ngưỡng kiểm tra từ chối giá.
 - `peak_map` — các khung của `/dinh`, span Fractal, deviation ZigZag, độ gom vùng và số vùng tối đa cần hiển thị.
+- `peak_execution` — đệm Entry/SL theo ATR và R:R cấu trúc tối thiểu trước khi `/dinh` được phép sinh kế hoạch.
 
 ## 6. Cấu trúc project
 
 ```
-data_provider/          # nguồn dữ liệu giá (Twelve Data), có thể thêm provider khác qua interface DataProvider
+data_provider/          # Binance Futures cho live; Twelve Data chỉ cho backtest tham chiếu
 indicators/              # signal_engine.py — chỉ báo, tín hiệu backtest (compute_signal) + bias liên tục (compute_momentum_bias)
 backtest/                # tải dữ liệu lịch sử, mô phỏng giao dịch, báo cáo hiệu quả
 alerting/                # gửi cảnh báo Telegram (dùng bởi main.py)
 main.py                  # (tuỳ chọn) vòng lặp polling live, tự đẩy tin khi tín hiệu đổi
-telegram_query_bot.py    # bot hỏi-đáp /signal, /gia — cách dùng chính
+telegram_query_bot.py    # bot hỏi-đáp /signal, /gia, /dinh — cách dùng chính
 run_backtest.py          # chạy backtest
 ```

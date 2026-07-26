@@ -26,6 +26,9 @@ class PricePressure:
     up_bars: int
     down_bars: int
     window_minutes: int
+    taker_buy_notional: float | None = None
+    taker_sell_notional: float | None = None
+    uses_trade_flow: bool = False
 
 
 @dataclass
@@ -141,7 +144,7 @@ def select_closed_candles(
     interval: str,
     now: datetime | None = None,
 ) -> pd.DataFrame:
-    """Return only completed candles; Twelve Data intraday timestamps mark bar starts."""
+    """Return only completed candles; the index timestamp marks the bar start."""
     now = now or datetime.now(timezone.utc)
     if now.tzinfo is None:
         now = now.replace(tzinfo=timezone.utc)
@@ -159,7 +162,7 @@ def select_closed_candles(
 
 
 def analyze_price_pressure(df: pd.DataFrame) -> PricePressure:
-    """Price-action proxy only; XAU/USD spot data has no centralized order book/volume."""
+    """Estimate short-term directional pressure from closed contract candles."""
     closes = df["close"].astype(float)
     changes = closes.diff().dropna()
     if changes.empty:
@@ -171,7 +174,33 @@ def analyze_price_pressure(df: pd.DataFrame) -> PricePressure:
     down_bars = int((changes < 0).sum())
     active_bars = max(1, up_bars + down_bars)
     bar_imbalance = (up_bars - down_bars) / active_bars
-    score = max(-1.0, min(1.0, 0.65 * directional_efficiency + 0.35 * bar_imbalance))
+    taker_buy_notional = None
+    taker_sell_notional = None
+    uses_trade_flow = False
+    if {"quote_volume", "taker_buy_quote_volume"}.issubset(df.columns):
+        quote_volume = pd.to_numeric(df["quote_volume"], errors="coerce").fillna(0)
+        taker_buy = pd.to_numeric(
+            df["taker_buy_quote_volume"],
+            errors="coerce",
+        ).fillna(0)
+        taker_buy_notional = float(taker_buy.sum())
+        total_notional = float(quote_volume.sum())
+        taker_sell_notional = max(0.0, total_notional - taker_buy_notional)
+        if total_notional > 0:
+            taker_imbalance = (
+                taker_buy_notional - taker_sell_notional
+            ) / total_notional
+            score = (
+                0.45 * directional_efficiency
+                + 0.20 * bar_imbalance
+                + 0.35 * taker_imbalance
+            )
+            uses_trade_flow = True
+        else:
+            score = 0.65 * directional_efficiency + 0.35 * bar_imbalance
+    else:
+        score = 0.65 * directional_efficiency + 0.35 * bar_imbalance
+    score = max(-1.0, min(1.0, score))
 
     if score >= 0.35:
         label = "ap luc gia mua chiem uu the"
@@ -183,11 +212,20 @@ def analyze_price_pressure(df: pd.DataFrame) -> PricePressure:
         label = "ap luc gia ban nhe"
     else:
         label = "mua/ban can bang"
-    return PricePressure(score, label, up_bars, down_bars, len(df))
+    return PricePressure(
+        score,
+        label,
+        up_bars,
+        down_bars,
+        len(df),
+        taker_buy_notional,
+        taker_sell_notional,
+        uses_trade_flow,
+    )
 
 
 def fetch_order_book_pressure(endpoint: str, symbol: str, limit: int = 100) -> OrderBookPressure | None:
-    """Use a tokenized-gold order book as a proxy, never as XAU/USD's own order book."""
+    """Measure visible bid/ask notional from a public order book snapshot."""
     try:
         response = requests.get(
             endpoint,
@@ -896,7 +934,7 @@ def render_price_chart(
     for spine in ax.spines.values():
         spine.set_color("#334155")
     ax.grid(alpha=0.12)
-    ax.set_title(f"XAU/USD - {interval_label} (60 nến đã đóng)", color="white")
+    ax.set_title(f"XAUUSDT PERP - {interval_label} (60 nến đã đóng)", color="white")
     ax.legend(loc="upper left", facecolor="#18212f", labelcolor="white")
     fig.tight_layout()
 
@@ -1006,7 +1044,7 @@ def render_multi_timeframe_chart(
             labelcolor="white",
         )
 
-    fig.suptitle("XAU/USD · 15m / 1H / 4H", color="white", fontsize=13)
+    fig.suptitle("Binance XAUUSDT PERP · 15m / 1H / 4H", color="white", fontsize=13)
     fig.tight_layout()
     output = BytesIO()
     output.name = "xau_multi_timeframe.png"
