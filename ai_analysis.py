@@ -272,6 +272,7 @@ Quy tắc bắt buộc:
 7. data_consistency chỉ đo độ đồng thuận dữ liệu, KHÔNG phải xác suất thắng.
 8. Mỗi trường văn bản tối đa 220 ký tự, cụ thể và tránh lặp lại.
 9. Funding, open interest, order book hoặc basis không được dùng riêng lẻ để kết luận LONG/SHORT.
+10. Nếu binance_futures_metrics.liquidity_guard.entries_allowed=false thì stance bắt buộc ĐỨNG NGOÀI và phải nêu rủi ro thanh khoản.
 """
 
 
@@ -439,6 +440,7 @@ def build_peak_ai_snapshot(
     execution_reason: str | None = None,
     liquidity: PeakLiquidityAssessment | None = None,
     hourly_structure: ChartStructure | None = None,
+    daily_structure: ChartStructure | None = None,
 ) -> dict:
     def zone_payload(zone) -> dict | None:
         if zone is None:
@@ -505,6 +507,16 @@ def build_peak_ai_snapshot(
             if hourly_structure is not None
             else None
         ),
+        "daily_structure": (
+            {
+                "trend": daily_structure.trend,
+                "pattern": daily_structure.pattern,
+                "support": round(daily_structure.support, 4),
+                "resistance": round(daily_structure.resistance, 4),
+            }
+            if daily_structure is not None
+            else None
+        ),
         "liquidity_guard": (
             {
                 "is_weekend": liquidity.is_weekend,
@@ -561,7 +573,7 @@ Quy tắc bắt buộc:
 4. Nêu rõ cần nến 15m đóng xác nhận và retest/từ chối vùng.
 5. Funding, OI, basis, volume và order book không được dùng riêng lẻ để chọn hướng.
 6. Mỗi trường văn bản tối đa 180 ký tự; data_consistency không phải xác suất thắng.
-7. Phải ưu tiên cấu trúc và nến đóng 1H. Nếu liquidity_guard.entries_allowed=false thì decision bắt buộc CHỜ.
+7. Phải ưu tiên cấu trúc 15m/1H/D1: 15m tìm Entry, 1H xác nhận, D1 không được đối nghịch mạnh. Nếu liquidity_guard.entries_allowed=false thì decision bắt buộc CHỜ.
 """
 
 

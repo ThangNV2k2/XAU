@@ -76,6 +76,8 @@ peak_map:
 # /dinh chỉ sinh Entry/SL/TP sau khi gate nến đóng đã xác nhận.
 peak_execution:
   require_1h_close_confirmation: true
+  require_daily_context: true
+  daily_opposition_limit: 0.15
   entry_buffer_atr: 0.15
   stop_buffer_atr: 0.20
   minimum_structural_rr: 1.5
@@ -87,6 +89,29 @@ peak_liquidity:
   volume_baseline_hours: 168
   minimum_volume_ratio: 0.45
   maximum_spread_bps: 3.0
+
+auto_alerts:
+  enabled: true
+  poll_seconds: 60
+  # Quet gia nhanh chi sau khi da phat setup LONG/SHORT; vong nay khong goi AI.
+  active_poll_seconds: 15
+  first_check_seconds: 10
+  notify_on_start: true
+  notify_approaching: true
+  # Gui canh bao code truoc, sau do goi AI rieng va gui thong bao xac thuc thu hai.
+  ai_review_after_alert: true
+  approach_buffer_pct: 0.01
+  same_setup_cooldown_minutes: 240
+  setup_timeout_minutes: 90
+  active_wave_max_minutes: 480
+  micro_candle_bars: 30
+  micro_weakness_threshold: 0.35
+  adverse_warning_r: 0.35
+  runaway_cancel_r: 0.50
+  structure_flip_threshold: 0.15
+  error_backoff_seconds: 60
+  send_hourly_chart: true
+  state_path: "logs/auto_alert_state.json"
 
 news:
   max_items: 4
@@ -115,6 +140,8 @@ ai_analysis:
   enabled: true
   peak_review_enabled: true
   timeout_seconds: 35
+  # Thong bao AI thu hai phai ket thuc (thanh cong hoac bao loi) trong khoang nay.
+  auto_review_total_timeout_seconds: 50
   groq:
     model: "qwen/qwen3.6-27b"
     usage_path: "logs/groq_usage.json"

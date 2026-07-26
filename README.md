@@ -40,9 +40,9 @@ python main.py --once
 
 In ra tín hiệu hiện tại (giá, từng chỉ báo, điểm tổng hợp) mà không cần Telegram, không chạy vòng lặp.
 
-## 4. Bot Telegram hỏi-đáp theo yêu cầu (khuyến nghị dùng cách này)
+## 4. Bot Telegram hỏi-đáp và tự canh Entry (khuyến nghị)
 
-Thay vì tự poll và đẩy tin (main.py), cách chính để dùng tool là **hỏi khi cần**: nhắn `/signal` hoặc `/gia` cho bot bất cứ lúc nào để xem tình hình hiện tại.
+Một tiến trình `telegram_query_bot.py` vừa trả lời lệnh, vừa tự canh XAUUSDT nền và đẩy cảnh báo khi setup đủ điều kiện; không cần chạy thêm `main.py`.
 
 1. Tạo bot qua [@BotFather](https://t.me/BotFather) trên Telegram → lấy `TELEGRAM_BOT_TOKEN`.
 2. Nhắn bất kỳ gì cho bot của bạn (VD "hi") để Telegram ghi nhận cuộc hội thoại.
@@ -52,6 +52,11 @@ Thay vì tự poll và đẩy tin (main.py), cách chính để dùng tool là *
    ```bash
    python telegram_query_bot.py
    ```
+   Ngay khi khởi động, bot gửi `CANH TỰ ĐỘNG XAUUSDT ĐÃ BẬT`. Mặc định bot kiểm tra mỗi 60 giây nhưng chỉ cảnh báo khi cùng logic với `/dinh` đã xác nhận, giá sát/vào vùng Entry và kế hoạch có R:R hợp lệ.
+   - `/canh` — xem lần kiểm tra, gate/lý do và lỗi gần nhất.
+   - `/canhbat` / `/canhtat` — bật hoặc tắt canh nền mà không dừng bot.
+   - Cùng một setup được chống gửi lặp; có thể báo hai giai đoạn `SÁT ENTRY` và `ĐÃ VÀO ENTRY`.
+   - Cảnh báo tự động không gọi AI nên không tốn quota Groq/Gemini; nó gửi Entry/SL/TP/khối lượng/cách đặt lệnh và biểu đồ 15m/1H/D1 từ code định lượng.
 6. Trong Telegram, nhắn `/signal` hoặc `/gia` cho bot → nhận ngay:
    - Giá bid/ask realtime từ Binance WebSocket; Last, Mark, Index, funding và open interest từ public Futures API.
    - Entry/vùng giá dựa trên nến giao dịch XAUUSDT; Mark Price dùng để theo dõi rủi ro PnL chưa thực hiện/thanh lý; Index và basis dùng để phát hiện lệch giá.
@@ -59,18 +64,22 @@ Thay vì tự poll và đẩy tin (main.py), cách chính để dùng tool là *
    - Volume và order book thật của XAUUSDT, không còn dùng PAXG làm proxy.
    - Vùng hỗ trợ/kháng cự động từ swing-high, swing-low đa khung và ATR. Hai vùng được tách rời; vùng nhiễu không được dùng làm entry.
    - Trạng thái breakout/breakdown và retest. Bot chỉ lập Entry/SL/TP/khối lượng/đòn bẩy khi đủ chuỗi: ba khung đồng thuận → nến 15m đóng phá vùng → nến sau retest xác nhận → tín hiệu backtest gần đây cùng hướng → giá hiện vẫn ở vùng vào.
+   - `/gia` và `/dinh` cùng dùng bộ lọc thanh khoản 1H; cuối tuần hoặc khi volume/spread không đạt ngưỡng thì cả hai đều khóa Entry.
    - Phân tích AI mới từ Groq, tự chuyển sang Gemini nếu cần. Luồng `/gia` không tái sử dụng cache AI hoặc cache tin tức.
    - AI nhận ảnh gộp cùng 8 nến OHLC gần nhất của mỗi khung, vùng giá, động lượng và tin tiếng Việt. AI không tự gọi thêm dữ liệu và không được tự tạo hay sửa Entry/SL/TP; nếu code chưa xác nhận entry thì kết luận AI bị ép thành `ĐỨNG NGOÀI`.
 
 7. Nhắn `/dinh` để nhận bản đồ đỉnh chuyên biệt:
+   - Bot gửi biểu đồ **15m / 1H / D1 nến đã đóng** với EMA9/EMA21, volume thật và các vùng kháng cự/hỗ trợ: 15m tìm Entry, 1H xác nhận, D1 kiểm tra xu hướng lớn.
    - Quét nến đã đóng 15m/1H/4H/D1 bằng Williams Fractal 5 nến.
    - Lọc nhiễu bằng ZigZag với deviation riêng cho từng khung; điểm ZigZag cuối chưa có swing ngược xác nhận không được cộng uy tín.
    - Gom các đỉnh gần nhau thành vùng, phân biệt đỉnh cũ/mới và chấm uy tín theo khung, số đỉnh hội tụ, phản ứng sau đỉnh và volume nếu nguồn thực sự có.
    - Đỉnh nằm trên giá được trình bày như cản; đỉnh cũ đã được nến 15m đóng vượt được trình bày riêng như hỗ trợ retest tiềm năng.
    - Sau bản đồ, AI review ngắn theo nến đóng và dữ liệu phái sinh hiện tại. Code khóa kết luận ở `CHỜ`, `CANH LONG` hoặc `CANH SHORT`; AI không được đảo hướng, tự tạo mốc giá hay Entry/SL/TP.
-   - `CANH LONG` chỉ được mở khi ba khung cùng tăng, 15m đã đóng phá cản và một nến sau retest giữ được. `CANH SHORT` cần ba khung cùng giảm và 15m đóng từ chối cản. Thiếu một điều kiện thì kết luận là `CHỜ`.
+   - `CANH LONG` chỉ được mở khi 15m/1H/4H cùng tăng, 15m phá/retest, 1H đóng trên cản và D1 không giảm mạnh. `CANH SHORT` dùng điều kiện đối xứng và D1 không được tăng mạnh. Thiếu một điều kiện thì kết luận là `CHỜ`.
    - Khi đã xác nhận, code mới tính vùng Entry retest, SL ngoài vùng theo ATR, TP1 ở 1R và TP2 tại cản/hỗ trợ cấu trúc kế tiếp. Nếu TP2 không đạt tối thiểu 1.5R thì bot ghi `KHÔNG VÀO`.
    - Kế hoạch kèm khối lượng theo rủi ro tài khoản, đòn bẩy isolated, cách chốt 50% tại TP1, dời SL về Entry và time-stop. Khi chưa xác nhận, `/dinh` chỉ đưa mốc cần chờ và yêu cầu gọi lại sau nến 15m đóng.
+   - Hướng dẫn thực thi ghi tuần tự cách đặt Limit Entry, Stop-Market theo Mark Price, TP1 50%, TP2 phần còn lại và hủy các lệnh đóng vị thế còn treo.
+   - Thanh khoản được đo bằng median volume 1H gần nhất so với median giờ ngày thường. Mặc định thứ Bảy/Chủ nhật chỉ vẽ vùng và không sinh Entry (`peak_liquidity.block_weekend_entries: true`).
 
    Chỉ chat có `chat_id` khớp trong `.env` mới được bot trả lời (người khác nhắn bot sẽ bị bỏ qua, tránh lộ và tốn quota API).
 
@@ -95,6 +104,8 @@ python main.py             # chạy thật, đẩy tin khi tín hiệu đổi tr
 - `resistance_test` — độ gom cụm swing theo ATR, độ rộng vùng và các ngưỡng kiểm tra từ chối giá.
 - `peak_map` — các khung của `/dinh`, span Fractal, deviation ZigZag, độ gom vùng và số vùng tối đa cần hiển thị.
 - `peak_execution` — đệm Entry/SL theo ATR và R:R cấu trúc tối thiểu trước khi `/dinh` được phép sinh kế hoạch.
+- `peak_liquidity` — tỷ lệ volume tối thiểu, spread tối đa và chính sách chặn Entry cuối tuần.
+- `auto_alerts` — quét cấu trúc nền mỗi 60 giây; khi có setup LONG/SHORT bot gửi cảnh báo code ngay, gọi AI ở tác vụ riêng để gửi thông báo xác thực thứ hai, rồi canh giá mỗi 15 giây. Nến 1m cập nhật mỗi phút; vòng canh nhanh không gọi AI.
 
 ## 6. Cấu trúc project
 

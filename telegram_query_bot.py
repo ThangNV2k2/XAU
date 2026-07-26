@@ -1,9 +1,11 @@
 import asyncio
+import json
 import logging
 import math
 import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import yaml
 from dotenv import load_dotenv
@@ -56,13 +58,14 @@ from realtime_price import BinanceFuturesPriceStream, RealtimeQuote
 from peak_analysis import (
     PeakExecutionPlan,
     PeakLiquidityAssessment,
+    PeakMap,
     PeakTradeGate,
     assess_peak_liquidity,
     assess_peak_trade_gate,
     build_peak_execution_plan,
     build_peak_map,
     format_peak_map,
-    render_peak_hourly_chart,
+    render_peak_confirmation_chart,
 )
 
 load_dotenv()
@@ -74,6 +77,7 @@ logging.basicConfig(
     handlers=[logging.FileHandler("logs/telegram_query_bot.log"), logging.StreamHandler()],
 )
 logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("apscheduler").setLevel(logging.WARNING)
 logger = logging.getLogger("gold-query-bot")
 
 SIGNAL_LABEL = {"BUY": "nghieng TANG", "SELL": "nghieng GIAM", "HOLD": "trung lap, chua ro huong"}
@@ -86,6 +90,16 @@ def load_config(path: str = "config.yaml") -> dict:
 
 def get_current_quote(provider, price_stream) -> RealtimeQuote:
     stream_quote = price_stream.latest()
+    if stream_quote is not None:
+        stream_age = (
+            datetime.now(timezone.utc) - stream_quote.received_at
+        ).total_seconds()
+        if stream_age > 15:
+            logger.warning(
+                "Ignoring stale Binance WebSocket quote age=%.1fs; using REST",
+                stream_age,
+            )
+            stream_quote = None
     quote = provider.get_quote()
     quote_timestamp = int(quote.get("last_quote_at") or quote.get("timestamp") or 0)
     market_open_value = quote.get("is_market_open", False)
@@ -152,6 +166,22 @@ def get_current_quote(provider, price_stream) -> RealtimeQuote:
     )
 
 
+def get_fast_quote(provider, price_stream) -> RealtimeQuote:
+    """Prefer the public WebSocket and use one lightweight REST call only if stale."""
+    stream_quote = price_stream.latest(max_received_age_seconds=15)
+    if stream_quote is not None:
+        return stream_quote
+    now = datetime.now(timezone.utc)
+    price = float(provider.get_latest_price())
+    return RealtimeQuote(
+        price=price,
+        market_time=now,
+        received_at=now,
+        source="Binance Futures REST ticker fallback",
+        is_market_open=True,
+    )
+
+
 COMPONENT_LABEL = {"rsi": "RSI momentum", "macd": "MACD", "ema_trend": "EMA trend", "bollinger": "Bollinger %B"}
 
 
@@ -173,6 +203,23 @@ class TradingPlan:
     holding_style: str
     max_holding_minutes: int
     allow_overnight: bool
+
+
+@dataclass
+class PeakOpportunity:
+    analysis_now: datetime
+    frames: dict
+    realtime_quote: RealtimeQuote
+    peak_map: PeakMap
+    liquidity: PeakLiquidityAssessment
+    hourly_structure: ChartStructure
+    daily_structure: ChartStructure
+    momentum_biases: dict[str, MomentumBias]
+    momentum_scores: dict[str, float]
+    gate: PeakTradeGate
+    execution_plan: PeakExecutionPlan | None
+    execution_reason: str
+    sized_plan: TradingPlan | None
 
 
 def interval_to_minutes(interval: str) -> int:
@@ -307,6 +354,8 @@ def format_peak_execution_guide(
     liquidity: PeakLiquidityAssessment,
     hourly_structure: ChartStructure,
     hourly_score: float,
+    daily_structure: ChartStructure,
+    daily_score: float,
 ) -> str:
     resistance = gate.resistance
     ratio_text = (
@@ -314,12 +363,29 @@ def format_peak_execution_guide(
         if liquidity.volume_ratio is not None
         else "chưa đủ mẫu so sánh"
     )
+    hourly_status = (
+        "CHƯA XÉT"
+        if not gate.multi_timeframe_aligned
+        else "ĐẠT"
+        if gate.hourly_confirmed
+        else "CHƯA ĐẠT"
+    )
+    daily_status = (
+        "CHƯA XÉT"
+        if not gate.multi_timeframe_aligned
+        else "ĐẠT"
+        if gate.daily_confirmed
+        else "CHƯA ĐẠT"
+    )
     lines = [
         "🎯 HƯỚNG DẪN THỰC THI",
         f"• 1H: {hourly_structure.pattern} · bias {hourly_score * 100:+.0f}% · "
         f"S {hourly_structure.support:.2f} / R {hourly_structure.resistance:.2f} · "
-        f"xác nhận {'ĐẠT' if gate.hourly_confirmed else 'CHƯA ĐẠT'}.",
-        f"• Thanh khoản: {liquidity.status} · volume {ratio_text}. {liquidity.reason}",
+        f"xác nhận {hourly_status}.",
+        f"• D1: {daily_structure.pattern} · bias {daily_score * 100:+.0f}% · "
+        f"S {daily_structure.support:.2f} / R {daily_structure.resistance:.2f} · "
+        f"không đối nghịch {daily_status}.",
+        f"• Thanh khoản: {liquidity.status} · volume {ratio_text}.",
     ]
     if resistance is None:
         return "\n".join(lines + ["• KHÔNG VÀO: chưa có vùng cản đủ tin cậy để lập kế hoạch."])
@@ -328,10 +394,12 @@ def format_peak_execution_guide(
         lines += [
             f"• Hiện tại: KHÔNG VÀO — {execution_reason}",
             f"• SHORT: chờ giá hồi vào {resistance.lower:.2f}–{resistance.upper:.2f}; "
-            f"15m từ chối và 1H đóng dưới {resistance.lower:.2f}, rồi retest không vượt lại vùng.",
+            f"15m từ chối, 1H đóng dưới {resistance.lower:.2f}, D1 không tăng mạnh; rồi retest không vượt lại vùng.",
             f"• LONG: chờ 15m đóng trên {resistance.upper:.2f}; nến sau retest "
-            f"{resistance.lower:.2f}–{resistance.upper:.2f}, đồng thời 1H đóng trên {resistance.upper:.2f}.",
+            f"{resistance.lower:.2f}–{resistance.upper:.2f}, 1H đóng trên cản và D1 không giảm mạnh.",
             "• Lúc này chưa đặt Limit/SL/TP. Đủ điều kiện thì gọi /dinh lại; râu nến không tính xác nhận.",
+            "• Khi bot có kế hoạch: Entry bằng Limit → khớp xong mới đặt Stop-Market toàn vị thế, trigger Mark Price.",
+            "• TP1 đóng 50%, TP2 đóng phần còn lại; cả hai phải là Close/Reduce-Only để không mở lệnh ngược.",
         ]
         return "\n".join(lines)
 
@@ -345,7 +413,7 @@ def format_peak_execution_guide(
     close_button = "Bán/Close Long" if plan.side == "LONG" else "Mua/Close Short"
     lines += [
         f"• {plan.side}: chờ giá quay lại {plan.entry_lower:.2f}–{plan.entry_upper:.2f} "
-        f"và nến 15m retest {retest_action}; 1H đã đóng xác nhận, không đuổi giá.",
+        f"và nến 15m retest {retest_action}; 1H xác nhận, D1 không đối nghịch, không đuổi giá.",
         f"• Entry tham chiếu {plan.entry_reference:.2f} · SL {plan.stop_loss:.2f} "
         "(Stop-Market, ưu tiên trigger Mark Price).",
         f"• TP1 {plan.take_profit_1:.2f} ({plan.reward_risk_1:.1f}R) · "
@@ -373,6 +441,121 @@ def format_peak_execution_guide(
         lines.append("• Không tính được khối lượng an toàn với số dư/cấu hình hiện tại; không vào lệnh.")
     lines.append("• Hủy kế hoạch nếu nến 15m đóng phá SL trước khi khớp Entry.")
     return "\n".join(lines)
+
+
+def compute_peak_opportunity(
+    config: dict,
+    provider,
+    price_stream,
+    analysis_now: datetime | None = None,
+) -> PeakOpportunity:
+    """Compute the exact /dinh opportunity for both manual queries and auto alerts."""
+    settings = config.get("peak_map", {})
+    timeframes = settings.get("timeframes", ["15min", "1h", "4h", "1day"])
+    outputsize = int(settings.get("outputsize", 200))
+    analysis_now = analysis_now or datetime.now(timezone.utc)
+    frames = {
+        timeframe: select_closed_candles(
+            provider.get_historical(
+                interval=timeframe,
+                outputsize=outputsize,
+            ),
+            timeframe,
+            analysis_now,
+        )
+        for timeframe in timeframes
+    }
+    realtime_quote = get_current_quote(provider, price_stream)
+    peak_map = build_peak_map(
+        frames=frames,
+        current_price=realtime_quote.price,
+        settings=settings,
+    )
+    liquidity = assess_peak_liquidity(
+        frames["1h"],
+        realtime_quote.price,
+        realtime_quote.bid_price,
+        realtime_quote.ask_price,
+        analysis_now=analysis_now,
+        settings=config.get("peak_liquidity", {}),
+    )
+    hourly_structure = find_chart_structure(frames["1h"])
+    daily_structure = find_chart_structure(frames["1day"])
+    analysis_frames = {
+        timeframe: frame
+        for timeframe, frame in frames.items()
+        if timeframe in ("15min", "1h", "4h", "1day")
+    }
+    momentum_biases = {
+        timeframe: compute_momentum_bias(frame, config["weights"])
+        for timeframe, frame in analysis_frames.items()
+    }
+    momentum_scores = {
+        timeframe: bias.composite
+        for timeframe, bias in momentum_biases.items()
+    }
+    gate = assess_peak_trade_gate(
+        peak_map,
+        frames["15min"],
+        momentum_scores,
+        {
+            **settings,
+            **config.get("signal_confirmation", {}),
+            **config.get("peak_execution", {}),
+        },
+        frame_1h=frames["1h"],
+        liquidity=liquidity,
+        daily_pattern=daily_structure.pattern,
+    )
+    execution_plan, execution_reason = build_peak_execution_plan(
+        peak_map,
+        gate,
+        frames["15min"],
+        {
+            **config.get("trading_plan", {}),
+            **config.get("peak_execution", {}),
+        },
+    )
+    sized_plan = None
+    if execution_plan is not None:
+        signal_result = compute_signal(
+            frames["15min"],
+            config["weights"],
+            {
+                "buy": config["threshold_buy"],
+                "sell": config["threshold_sell"],
+            },
+            atr_stop_multiplier=config.get("atr_stop_multiplier", 1.5),
+        )
+        sized_plan = build_trading_plan(
+            momentum_biases["15min"],
+            signal_result,
+            {
+                **config.get("trading_plan", {}),
+                "minimum_bias": 0.0,
+            },
+            actionable=True,
+            side_override=execution_plan.side,
+            entry_override=execution_plan.entry_reference,
+            stop_override=execution_plan.stop_loss,
+            take_profit_1_override=execution_plan.take_profit_1,
+            take_profit_2_override=execution_plan.take_profit_2,
+        )
+    return PeakOpportunity(
+        analysis_now=analysis_now,
+        frames=frames,
+        realtime_quote=realtime_quote,
+        peak_map=peak_map,
+        liquidity=liquidity,
+        hourly_structure=hourly_structure,
+        daily_structure=daily_structure,
+        momentum_biases=momentum_biases,
+        momentum_scores=momentum_scores,
+        gate=gate,
+        execution_plan=execution_plan,
+        execution_reason=execution_reason,
+        sized_plan=sized_plan,
+    )
 
 
 def format_reply(bias: MomentumBias, result: SignalResult, interval: str, plan_settings: dict) -> str:
@@ -563,6 +746,7 @@ def format_compact_reply(
     resistance_test: ResistanceZoneAnalysis,
     retest: RetestAssessment,
     realtime_quote: RealtimeQuote,
+    liquidity: PeakLiquidityAssessment | None = None,
 ) -> tuple[str, TradingPlan | None, ScenarioLevels]:
     planning_bias = MomentumBias(
         price=bias.price,
@@ -576,6 +760,7 @@ def format_compact_reply(
         and retest.entry_lower is not None
         and retest.entry_upper is not None
         and retest.invalidation is not None
+        and (liquidity is None or liquidity.entries_allowed)
     ):
         plan = build_trading_plan(
             planning_bias,
@@ -653,11 +838,28 @@ def format_compact_reply(
     if derivatives_parts:
         fair_value_lines.append(" · ".join(derivatives_parts))
 
+    decision_reason = (
+        liquidity.reason
+        if liquidity is not None and not liquidity.entries_allowed
+        else retest.decision_reason
+    )
+    liquidity_line = (
+        f"Thanh khoản: {liquidity.status} · volume 1H "
+        + (
+            f"{liquidity.volume_ratio:.0%} median ngày thường."
+            if liquidity.volume_ratio is not None
+            else "chưa đủ mẫu so sánh."
+        )
+        if liquidity is not None
+        else None
+    )
+
     lines = [
         f"📊 *XAUUSDT PERP {bias.price:.2f}* · {feed_status} · {realtime_quote.source}",
         f"Nguồn lúc {quote_time.astimezone().strftime('%d/%m %H:%M:%S')}",
         *fair_value_lines,
-        f"🧭 *QUYẾT ĐỊNH: {forecast}* — {retest.decision_reason}",
+        *([liquidity_line] if liquidity_line is not None else []),
+        f"🧭 *QUYẾT ĐỊNH: {forecast}* — {decision_reason}",
         "",
         "🧱 *VÙNG GIÁ*",
         f"• Hỗ trợ: *{retest.support.lower:.2f}–{retest.support.upper:.2f}*",
@@ -781,6 +983,14 @@ async def handle_signal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         latest_price = realtime_quote.price
         bias.price = latest_price
         result.price = latest_price
+        liquidity = assess_peak_liquidity(
+            frames["1h"],
+            latest_price,
+            realtime_quote.bid_price,
+            realtime_quote.ask_price,
+            analysis_now=analysis_now,
+            settings=config.get("peak_liquidity", {}),
+        )
         resistance_test = analyze_resistance_zone(
             df=df,
             current_price=latest_price,
@@ -820,6 +1030,7 @@ async def handle_signal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             resistance_test,
             retest,
             realtime_quote,
+            liquidity,
         )
         multi_chart = render_multi_timeframe_chart(
             frames=frames,
@@ -883,6 +1094,13 @@ async def handle_signal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                     "ask": realtime_quote.ask_price,
                     "funding_rate": realtime_quote.funding_rate,
                     "open_interest": realtime_quote.open_interest,
+                    "liquidity_guard": {
+                        "status": liquidity.status,
+                        "is_weekend": liquidity.is_weekend,
+                        "volume_ratio_vs_weekday_median": liquidity.volume_ratio,
+                        "entries_allowed": liquidity.entries_allowed,
+                        "reason": liquidity.reason,
+                    },
                 },
             )
             candidates = []
@@ -1035,38 +1253,23 @@ async def handle_peaks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     price_stream = context.bot_data["price_stream"]
     settings = config.get("peak_map", {})
     try:
-        timeframes = settings.get(
-            "timeframes",
-            ["15min", "1h", "4h", "1day"],
+        opportunity = await asyncio.to_thread(
+            compute_peak_opportunity,
+            config,
+            provider,
+            price_stream,
         )
-        outputsize = int(settings.get("outputsize", 200))
-        analysis_now = datetime.now(timezone.utc)
-        frames = {
-            timeframe: select_closed_candles(
-                provider.get_historical(
-                    interval=timeframe,
-                    outputsize=outputsize,
-                ),
-                timeframe,
-                analysis_now,
-            )
-            for timeframe in timeframes
-        }
-        realtime_quote = get_current_quote(provider, price_stream)
-        peak_map = build_peak_map(
-            frames=frames,
-            current_price=realtime_quote.price,
-            settings=settings,
-        )
-        liquidity = assess_peak_liquidity(
-            frames["1h"],
-            realtime_quote.price,
-            realtime_quote.bid_price,
-            realtime_quote.ask_price,
-            analysis_now=analysis_now,
-            settings=config.get("peak_liquidity", {}),
-        )
-        hourly_structure = find_chart_structure(frames["1h"])
+        frames = opportunity.frames
+        realtime_quote = opportunity.realtime_quote
+        peak_map = opportunity.peak_map
+        liquidity = opportunity.liquidity
+        hourly_structure = opportunity.hourly_structure
+        daily_structure = opportunity.daily_structure
+        momentum_scores = opportunity.momentum_scores
+        gate = opportunity.gate
+        execution_plan = opportunity.execution_plan
+        execution_reason = opportunity.execution_reason
+        sized_plan = opportunity.sized_plan
         reply = format_peak_map(peak_map, settings)
         logger.info(
             "Peak map requested by chat %s: peaks=%s resistance=%s support=%s",
@@ -1076,16 +1279,16 @@ async def handle_peaks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             len(peak_map.converted_support_zones),
         )
         try:
-            hourly_chart = render_peak_hourly_chart(
-                frames["1h"],
+            hourly_chart = render_peak_confirmation_chart(
+                frames,
                 peak_map,
                 liquidity,
             )
             await update.message.reply_photo(
                 photo=hourly_chart,
                 caption=(
-                    "XAUUSDT 1H · nến đã đóng · EMA9/EMA21 · "
-                    "kháng cự/hỗ trợ và volume thật."
+                    "XAUUSDT · 15m tìm Entry / 1H xác nhận / D1 xu hướng · "
+                    "nến đóng và volume thật."
                 ),
             )
         except Exception:
@@ -1095,69 +1298,6 @@ async def handle_peaks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             parse_mode="Markdown",
             disable_web_page_preview=True,
         )
-        analysis_frames = {
-            timeframe: frame
-            for timeframe, frame in frames.items()
-            if timeframe in ("15min", "1h", "4h")
-        }
-        momentum_biases = {
-            timeframe: compute_momentum_bias(
-                frame,
-                config["weights"],
-            )
-            for timeframe, frame in analysis_frames.items()
-        }
-        momentum_scores = {
-            timeframe: bias.composite
-            for timeframe, bias in momentum_biases.items()
-        }
-        gate = assess_peak_trade_gate(
-            peak_map,
-            frames["15min"],
-            momentum_scores,
-            {
-                **settings,
-                **config.get("signal_confirmation", {}),
-                **config.get("peak_execution", {}),
-            },
-            frame_1h=frames["1h"],
-            liquidity=liquidity,
-        )
-        execution_settings = {
-            **config.get("trading_plan", {}),
-            **config.get("peak_execution", {}),
-        }
-        execution_plan, execution_reason = build_peak_execution_plan(
-            peak_map,
-            gate,
-            frames["15min"],
-            execution_settings,
-        )
-        sized_plan = None
-        if execution_plan is not None:
-            signal_result = compute_signal(
-                frames["15min"],
-                config["weights"],
-                {
-                    "buy": config["threshold_buy"],
-                    "sell": config["threshold_sell"],
-                },
-                atr_stop_multiplier=config.get("atr_stop_multiplier", 1.5),
-            )
-            sized_plan = build_trading_plan(
-                momentum_biases["15min"],
-                signal_result,
-                {
-                    **config.get("trading_plan", {}),
-                    "minimum_bias": 0.0,
-                },
-                actionable=True,
-                side_override=execution_plan.side,
-                entry_override=execution_plan.entry_reference,
-                stop_override=execution_plan.stop_loss,
-                take_profit_1_override=execution_plan.take_profit_1,
-                take_profit_2_override=execution_plan.take_profit_2,
-            )
         execution_guide = format_peak_execution_guide(
             gate,
             execution_plan,
@@ -1166,6 +1306,8 @@ async def handle_peaks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             liquidity,
             hourly_structure,
             momentum_scores["1h"],
+            daily_structure,
+            momentum_scores["1day"],
         )
         ai_execution_plan = execution_plan if sized_plan is not None else None
         ai_execution_reason = execution_reason
@@ -1195,6 +1337,7 @@ async def handle_peaks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 execution_reason=ai_execution_reason,
                 liquidity=liquidity,
                 hourly_structure=hourly_structure,
+                daily_structure=daily_structure,
             )
             timeout_seconds = int(ai_config.get("timeout_seconds", 35))
             candidates = []
@@ -1359,11 +1502,1002 @@ async def handle_peaks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
 
 
+def _load_auto_alert_state(path: str) -> dict:
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        return payload if isinstance(payload, dict) else {}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def _save_auto_alert_state(path: str, state: dict) -> None:
+    state_path = Path(path)
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(
+        json.dumps(state, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _persist_active_wave(settings: dict, active_wave: dict | None) -> None:
+    state_path = settings.get("state_path", "logs/auto_alert_state.json")
+    state = _load_auto_alert_state(state_path)
+    if active_wave is None:
+        state.pop("active_wave", None)
+    else:
+        state["active_wave"] = active_wave
+    _save_auto_alert_state(state_path, state)
+
+
+def _parse_utc(value) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
+def _auto_alert_fingerprint(plan: PeakExecutionPlan, phase: str) -> str:
+    return "|".join(
+        [
+            plan.side,
+            f"{plan.entry_lower:.2f}",
+            f"{plan.entry_upper:.2f}",
+            f"{plan.stop_loss:.2f}",
+            f"{plan.take_profit_1:.2f}",
+            f"{plan.take_profit_2:.2f}",
+            phase,
+        ]
+    )
+
+
+def _auto_alert_phase(
+    opportunity: PeakOpportunity,
+    settings: dict,
+) -> tuple[str | None, float]:
+    plan = opportunity.execution_plan
+    if plan is None or opportunity.sized_plan is None:
+        return None, opportunity.realtime_quote.price
+    quote = opportunity.realtime_quote
+    executable_price = (
+        quote.ask_price
+        if plan.side == "LONG" and quote.ask_price is not None
+        else quote.bid_price
+        if plan.side == "SHORT" and quote.bid_price is not None
+        else quote.price
+    )
+    if plan.entry_lower <= executable_price <= plan.entry_upper:
+        return "IN_ZONE", executable_price
+    distance = min(
+        abs(executable_price - plan.entry_lower),
+        abs(executable_price - plan.entry_upper),
+    )
+    approach_pct = max(0.0, float(settings.get("approach_buffer_pct", 0.01)))
+    if settings.get("notify_approaching", True) and distance <= quote.price * approach_pct / 100:
+        return "APPROACHING", executable_price
+    return None, executable_price
+
+
+def _build_active_wave(
+    opportunity: PeakOpportunity,
+    phase: str,
+    checked_at: datetime,
+    settings: dict,
+) -> dict:
+    plan = opportunity.execution_plan
+    sized_plan = opportunity.sized_plan
+    if plan is None or sized_plan is None:
+        raise ValueError("Active wave requires a complete execution and sizing plan")
+    entered = phase == "IN_ZONE"
+    timeout_minutes = (
+        min(
+            max(1, sized_plan.max_holding_minutes),
+            max(1, int(settings.get("active_wave_max_minutes", 480))),
+        )
+        if entered
+        else max(1, int(settings.get("setup_timeout_minutes", 90)))
+    )
+    return {
+        "fingerprint": _auto_alert_fingerprint(plan, "TRACKING"),
+        "side": plan.side,
+        "phase": "ACTIVE" if entered else "WAITING_ENTRY",
+        "entered": entered,
+        "started_at": checked_at.isoformat(),
+        "entered_at": checked_at.isoformat() if entered else None,
+        "expires_at": (checked_at + timedelta(minutes=timeout_minutes)).isoformat(),
+        "last_check_at": checked_at.isoformat(),
+        "last_price": opportunity.realtime_quote.price,
+        "entry_lower": plan.entry_lower,
+        "entry_upper": plan.entry_upper,
+        "entry_reference": plan.entry_reference,
+        "stop_loss": plan.stop_loss,
+        "take_profit_1": plan.take_profit_1,
+        "take_profit_2": plan.take_profit_2,
+        "quantity_xau": sized_plan.quantity_xau,
+        "leverage": sized_plan.leverage,
+        "risk_usdt": sized_plan.risk_usdt,
+        "max_holding_minutes": sized_plan.max_holding_minutes,
+        "tp1_notified": False,
+        "weakness_notified": False,
+        "last_micro_bucket": None,
+        "pressure_score": None,
+        "pressure_label": None,
+        "micro_monotonic_opposite": False,
+    }
+
+
+def _get_active_wave(context, settings: dict) -> dict | None:
+    if "active_wave" in context.bot_data:
+        value = context.bot_data["active_wave"]
+        return value if isinstance(value, dict) else None
+    state = _load_auto_alert_state(
+        settings.get("state_path", "logs/auto_alert_state.json")
+    )
+    value = state.get("active_wave")
+    active_wave = value if isinstance(value, dict) else None
+    if active_wave is not None:
+        expires_at = _parse_utc(active_wave.get("expires_at"))
+        started_at = _parse_utc(active_wave.get("started_at"))
+        too_stale = (
+            started_at is None
+            or datetime.now(timezone.utc) - started_at > timedelta(hours=24)
+        )
+        if expires_at is None or too_stale:
+            active_wave = None
+            _persist_active_wave(settings, None)
+    context.bot_data["active_wave"] = active_wave
+    return active_wave
+
+
+def _set_active_wave(context, settings: dict, active_wave: dict | None) -> None:
+    context.bot_data["active_wave"] = active_wave
+    _persist_active_wave(settings, active_wave)
+
+
+def _wave_price(active_wave: dict, quote: RealtimeQuote, entering: bool) -> float:
+    side = active_wave["side"]
+    if entering:
+        if side == "LONG" and quote.ask_price is not None:
+            return quote.ask_price
+        if side == "SHORT" and quote.bid_price is not None:
+            return quote.bid_price
+    else:
+        if side == "LONG" and quote.bid_price is not None:
+            return quote.bid_price
+        if side == "SHORT" and quote.ask_price is not None:
+            return quote.ask_price
+    return quote.price
+
+
+def _wave_r(active_wave: dict) -> float:
+    return max(
+        1e-9,
+        abs(float(active_wave["entry_reference"]) - float(active_wave["stop_loss"])),
+    )
+
+
+def _wave_progress_r(active_wave: dict, price: float) -> float:
+    direction = 1.0 if active_wave["side"] == "LONG" else -1.0
+    return direction * (price - float(active_wave["entry_reference"])) / _wave_r(active_wave)
+
+
+def _format_active_wave_alert(
+    event: str,
+    active_wave: dict,
+    price: float,
+    detail: str = "",
+) -> str:
+    side = active_wave["side"]
+    entry_lower = float(active_wave["entry_lower"])
+    entry_upper = float(active_wave["entry_upper"])
+    stop = float(active_wave["stop_loss"])
+    tp1 = float(active_wave["take_profit_1"])
+    tp2 = float(active_wave["take_profit_2"])
+    progress = _wave_progress_r(active_wave, price)
+    checked = datetime.now().astimezone().strftime("%H:%M:%S")
+    if event == "ENTRY":
+        return (
+            f"🚨 KÈO {side} ĐÃ KÍCH HOẠT\n"
+            f"• Giá {price:.2f} đã vào Entry {entry_lower:.2f}–{entry_upper:.2f}.\n"
+            f"• SL {stop:.2f} · TP1 {tp1:.2f} · TP2 {tp2:.2f}.\n"
+            f"• Bot bắt đầu canh sóng mỗi 15 giây ({checked}); không Market đuổi giá."
+        )
+    if event == "WEAK":
+        return (
+            f"⚠️ SÓNG {side} ĐANG YẾU\n"
+            f"• Giá {price:.2f} · tiến độ {progress:+.2f}R. {detail}\n"
+            "• Không thêm lệnh; giữ đúng SL và chờ xác nhận 15m. Chưa coi là kết thúc sóng."
+        )
+    if event == "TP1":
+        return (
+            f"✅ {side} ĐÃ CHẠM TP1 {tp1:.2f}\n"
+            f"• Giá {price:.2f} · tiến độ {progress:+.2f}R.\n"
+            f"• Chốt 50% và dời SL phần còn lại về Entry {float(active_wave['entry_reference']):.2f}."
+        )
+    if event == "TP2":
+        return (
+            f"🛑🛑 SÓNG {side} ĐÃ HOÀN TẤT — CHỐT LỆNH\n"
+            f"• Giá {price:.2f} đã chạm TP2 {tp2:.2f} ({progress:+.2f}R).\n"
+            "• Chốt phần còn lại, hủy lệnh chờ và không đuổi theo sóng cũ."
+        )
+    if event == "BREAKEVEN":
+        return (
+            f"🛑🛑 SÓNG {side} ĐÃ KẾT THÚC — BẢO TOÀN LỢI NHUẬN\n"
+            f"• Sau TP1, giá đã quay về Entry {float(active_wave['entry_reference']):.2f}.\n"
+            "• Đóng phần còn lại theo SL hòa vốn; không gồng và không vào lại ngay."
+        )
+    if event in {"STOP", "STRUCTURE_END"}:
+        reason = (
+            f"giá đã chạm mức vô hiệu/SL {stop:.2f}"
+            if event == "STOP"
+            else detail
+        )
+        return (
+            f"🛑🛑 SÓNG {side} ĐÃ KẾT THÚC — DỪNG KÈO\n"
+            f"• Giá {price:.2f}: {reason}.\n"
+            "• Đóng/giữ đúng SL, không gồng lỗ và không tự động đảo chiều."
+        )
+    if event == "TIME_STOP":
+        return (
+            f"🛑🛑 SÓNG {side} ĐÃ HẾT THỜI GIAN — ĐÓNG KÈO\n"
+            f"• Giá hiện tại {price:.2f} · tiến độ {progress:+.2f}R.\n"
+            "• Đóng phần còn lại theo time-stop; không kéo dài một kèo ngắn hạn sang qua ngày."
+        )
+    if event in {"INVALIDATED", "RUNAWAY", "EXPIRED"}:
+        title = {
+            "INVALIDATED": "SETUP ĐÃ BỊ VÔ HIỆU",
+            "RUNAWAY": "BỎ KÈO — KHÔNG ĐUỔI GIÁ",
+            "EXPIRED": "SETUP ĐÃ HẾT HẠN",
+        }[event]
+        return (
+            f"⛔ {title} ({side})\n"
+            f"• Giá {price:.2f}. {detail}\n"
+            "• Bot dừng canh setup này; chờ tín hiệu cấu trúc mới."
+        )
+    raise ValueError(f"Unsupported active-wave event: {event}")
+
+
+def _fast_wave_event(active_wave: dict, price: float, settings: dict) -> str | None:
+    side = active_wave["side"]
+    entered = bool(active_wave.get("entered"))
+    stop = float(active_wave["stop_loss"])
+    tp1 = float(active_wave["take_profit_1"])
+    tp2 = float(active_wave["take_profit_2"])
+    entry = float(active_wave["entry_reference"])
+    lower = float(active_wave["entry_lower"])
+    upper = float(active_wave["entry_upper"])
+
+    if not entered:
+        if (side == "LONG" and price <= stop) or (side == "SHORT" and price >= stop):
+            return "INVALIDATED"
+        if lower <= price <= upper:
+            return "ENTRY"
+        runaway_r = max(0.1, float(settings.get("runaway_cancel_r", 0.5)))
+        if (side == "LONG" and price > upper + runaway_r * _wave_r(active_wave)) or (
+            side == "SHORT" and price < lower - runaway_r * _wave_r(active_wave)
+        ):
+            return "RUNAWAY"
+        expires_at = _parse_utc(active_wave.get("expires_at"))
+        if expires_at is not None and datetime.now(timezone.utc) >= expires_at:
+            return "EXPIRED"
+        return None
+
+    if (side == "LONG" and price >= tp2) or (side == "SHORT" and price <= tp2):
+        return "TP2"
+    if active_wave.get("tp1_notified") and (
+        (side == "LONG" and price <= entry) or (side == "SHORT" and price >= entry)
+    ):
+        return "BREAKEVEN"
+    if (side == "LONG" and price <= stop) or (side == "SHORT" and price >= stop):
+        return "STOP"
+    if not active_wave.get("tp1_notified") and (
+        (side == "LONG" and price >= tp1) or (side == "SHORT" and price <= tp1)
+    ):
+        return "TP1"
+    expires_at = _parse_utc(active_wave.get("expires_at"))
+    if expires_at is not None and datetime.now(timezone.utc) >= expires_at:
+        return "TIME_STOP"
+    return None
+
+
+def _refresh_micro_pressure(
+    provider,
+    active_wave: dict,
+    checked_at: datetime,
+    settings: dict,
+) -> tuple[float | None, bool, bool]:
+    """Fetch closed 1m candles once per minute, not on every 15-second tick."""
+    current_bucket = checked_at.replace(second=0, microsecond=0).isoformat()
+    if active_wave.get("last_micro_bucket") == current_bucket:
+        return (
+            active_wave.get("pressure_score"),
+            bool(active_wave.get("micro_monotonic_opposite")),
+            False,
+        )
+    bars = max(10, min(100, int(settings.get("micro_candle_bars", 30))))
+    frame = select_closed_candles(
+        provider.get_historical("1min", outputsize=bars + 1),
+        "1min",
+        checked_at,
+    ).tail(bars)
+    pressure = analyze_price_pressure(frame)
+    closes = frame["close"].astype(float).tail(3)
+    deltas = closes.diff().dropna()
+    side = active_wave["side"]
+    monotonic_opposite = bool(
+        len(deltas) >= 2
+        and ((deltas < 0).all() if side == "LONG" else (deltas > 0).all())
+    )
+    active_wave["last_micro_bucket"] = current_bucket
+    active_wave["pressure_score"] = pressure.score
+    active_wave["pressure_label"] = pressure.label
+    active_wave["micro_monotonic_opposite"] = monotonic_opposite
+    return pressure.score, monotonic_opposite, True
+
+
+def _full_scan_wave_end_event(
+    active_wave: dict,
+    opportunity: PeakOpportunity,
+    settings: dict,
+) -> tuple[str | None, str]:
+    if not active_wave.get("entered"):
+        return None, ""
+    side = active_wave["side"]
+    stop = float(active_wave["stop_loss"])
+    last_15m_close = float(opportunity.frames["15min"]["close"].iloc[-1])
+    if (side == "LONG" and last_15m_close <= stop) or (
+        side == "SHORT" and last_15m_close >= stop
+    ):
+        return "STRUCTURE_END", "nến 15m đã đóng phá mức vô hiệu"
+    threshold = max(0.05, float(settings.get("structure_flip_threshold", 0.15)))
+    score_15m = opportunity.momentum_scores["15min"]
+    score_1h = opportunity.momentum_scores["1h"]
+    both_opposite = (
+        score_15m <= -threshold and score_1h <= -threshold
+        if side == "LONG"
+        else score_15m >= threshold and score_1h >= threshold
+    )
+    if both_opposite:
+        return (
+            "STRUCTURE_END",
+            f"15m và 1H đã cùng đảo chiều (điểm {score_15m:+.2f}/{score_1h:+.2f})",
+        )
+    return None, ""
+
+
+def format_auto_entry_alert(
+    opportunity: PeakOpportunity,
+    phase: str,
+    executable_price: float,
+) -> str:
+    plan = opportunity.execution_plan
+    sized_plan = opportunity.sized_plan
+    if plan is None or sized_plan is None:
+        raise ValueError("Auto alert requires a complete execution and sizing plan")
+    phase_text = "GIÁ ĐÃ VÀO VÙNG ENTRY" if phase == "IN_ZONE" else "GIÁ ĐANG SÁT VÙNG ENTRY"
+    checked_at = opportunity.analysis_now.astimezone().strftime("%d/%m %H:%M:%S")
+    guide = format_peak_execution_guide(
+        opportunity.gate,
+        plan,
+        opportunity.execution_reason,
+        sized_plan,
+        opportunity.liquidity,
+        opportunity.hourly_structure,
+        opportunity.momentum_scores["1h"],
+        opportunity.daily_structure,
+        opportunity.momentum_scores["1day"],
+    )
+    return "\n".join(
+        [
+            f"🔔 AUTO XAUUSDT — {phase_text}",
+            f"• {plan.side} · giá khớp tham chiếu {executable_price:.2f} · kiểm tra {checked_at}.",
+            "• Mở Binance để đối chiếu nến và lệnh; bot không tự đặt lệnh.",
+            "",
+            guide,
+        ]
+    )
+
+
+def _build_auto_peak_ai_snapshot(opportunity: PeakOpportunity) -> dict:
+    return build_peak_ai_snapshot(
+        peak_map=opportunity.peak_map,
+        gate=opportunity.gate,
+        frames=opportunity.frames,
+        momentum_scores=opportunity.momentum_scores,
+        derivatives_metrics={
+            "last_or_mid_price": opportunity.realtime_quote.price,
+            "mark_price": opportunity.realtime_quote.mark_price,
+            "index_price": opportunity.realtime_quote.index_price,
+            "bid": opportunity.realtime_quote.bid_price,
+            "ask": opportunity.realtime_quote.ask_price,
+            "funding_rate": opportunity.realtime_quote.funding_rate,
+            "open_interest": opportunity.realtime_quote.open_interest,
+        },
+        execution_plan=opportunity.execution_plan,
+        execution_reason=opportunity.execution_reason,
+        liquidity=opportunity.liquidity,
+        hourly_structure=opportunity.hourly_structure,
+        daily_structure=opportunity.daily_structure,
+    )
+
+
+def _auto_peak_ai_candidates(ai_config: dict) -> list[dict]:
+    candidates = []
+    groq_key = os.getenv("GROQ_API_KEY")
+    groq_config = ai_config.get("groq", {})
+    if groq_key:
+        groq_model = groq_config.get("model", "qwen/qwen3.6-27b")
+        candidates.append(
+            {
+                "provider": "Groq",
+                "model": groq_model,
+                "label": f"Groq · {groq_model}",
+                "api_key": groq_key,
+                "analyzer": analyze_peak_with_groq,
+                "usage_path": groq_config.get(
+                    "usage_path",
+                    "logs/groq_usage.json",
+                ),
+                "daily_budget": int(groq_config.get("daily_call_budget", 900)),
+                "cooldown_minutes": int(
+                    groq_config.get("rate_limit_cooldown_minutes", 2)
+                ),
+            }
+        )
+
+    gemini_key = os.getenv("GEMINI_API_KEY")
+    gemini_config = ai_config.get("gemini", {})
+    if gemini_key:
+        gemini_models = [
+            gemini_config.get("model", "gemini-3.6-flash"),
+            gemini_config.get("fallback_model", "gemini-3.5-flash-lite"),
+        ]
+        for gemini_model in dict.fromkeys(filter(None, gemini_models)):
+            candidates.append(
+                {
+                    "provider": "Gemini",
+                    "model": gemini_model,
+                    "label": f"Gemini · {gemini_model}",
+                    "api_key": gemini_key,
+                    "analyzer": analyze_peak_with_gemini,
+                    "usage_path": gemini_config.get(
+                        "usage_path",
+                        "logs/gemini_usage.json",
+                    ),
+                    "daily_budget": int(
+                        gemini_config.get("daily_call_budget", 15)
+                    ),
+                    "cooldown_minutes": int(
+                        gemini_config.get("rate_limit_cooldown_minutes", 60)
+                    ),
+                }
+            )
+    return candidates
+
+
+async def _request_auto_peak_ai_review(
+    context: ContextTypes.DEFAULT_TYPE,
+    snapshot: dict,
+) -> tuple[object | None, str | None, str | None]:
+    ai_config = context.bot_data["config"].get("ai_analysis", {})
+    if not ai_config.get("enabled", True) or not ai_config.get(
+        "peak_review_enabled",
+        True,
+    ):
+        return None, None, "AI review đang tắt trong cấu hình"
+    candidates = _auto_peak_ai_candidates(ai_config)
+    if not candidates:
+        return None, None, "chưa có GROQ_API_KEY hoặc GEMINI_API_KEY"
+
+    timeout_seconds = int(ai_config.get("timeout_seconds", 35))
+    unavailable_reasons = []
+    last_error = None
+    for candidate in candidates:
+        blocker_key = (
+            f"ai_blocked_until:{candidate['provider']}:{candidate['model']}"
+        )
+        blocked_until = context.bot_data.get(blocker_key)
+        if blocked_until is not None and datetime.now(timezone.utc) < blocked_until:
+            unavailable_reasons.append(f"{candidate['label']} đang cooldown")
+            continue
+        if not ai_daily_budget_available(
+            candidate["usage_path"],
+            candidate["daily_budget"],
+        ):
+            unavailable_reasons.append(
+                f"{candidate['label']} đã hết ngân sách ngày"
+            )
+            continue
+
+        record_ai_call(candidate["usage_path"])
+        try:
+            review = await asyncio.wait_for(
+                asyncio.to_thread(
+                    candidate["analyzer"],
+                    candidate["api_key"],
+                    candidate["model"],
+                    timeout_seconds,
+                    snapshot,
+                ),
+                timeout=timeout_seconds + 5,
+            )
+            return review, candidate["label"], None
+        except Exception as exc:
+            last_error = exc
+            if is_ai_rate_limit_error(exc):
+                context.bot_data[blocker_key] = (
+                    datetime.now(timezone.utc)
+                    + timedelta(minutes=candidate["cooldown_minutes"])
+                )
+                unavailable_reasons.append(f"{candidate['label']} bị rate limit")
+            else:
+                unavailable_reasons.append(
+                    f"{candidate['label']} lỗi {type(exc).__name__}"
+                )
+            logger.warning(
+                "Auto alert AI %s failed: %s",
+                candidate["label"],
+                type(exc).__name__,
+            )
+
+    if unavailable_reasons:
+        return None, None, "; ".join(unavailable_reasons)
+    if last_error is not None:
+        return None, None, f"AI lỗi {type(last_error).__name__}"
+    return None, None, "không có model AI khả dụng"
+
+
+async def auto_alert_ai_review_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send the second, asynchronous AI verification message for an auto alert."""
+    data = context.job.data if context.job is not None else None
+    if not isinstance(data, dict):
+        return
+    chat_id = data["chat_id"]
+    gate = data["gate"]
+    side = data["side"]
+    try:
+        ai_config = context.bot_data["config"].get("ai_analysis", {})
+        review, used_label, unavailable_reason = await asyncio.wait_for(
+            _request_auto_peak_ai_review(
+                context,
+                data["snapshot"],
+            ),
+            timeout=max(
+                10,
+                int(ai_config.get("auto_review_total_timeout_seconds", 50)),
+            ),
+        )
+        expected_decision = f"CANH {side}"
+        if review is not None and used_label is not None:
+            if review.decision == expected_decision:
+                verdict = (
+                    f"✅ AI XÁC THỰC: ĐỒNG THUẬN {side}\n"
+                    "AI chỉ là lớp kiểm tra thứ hai, không phải bảo đảm thắng."
+                )
+            else:
+                verdict = (
+                    f"⚠️ AI CHƯA XÁC THỰC KÈO {side}\n"
+                    "Nếu chưa vào: tiếp tục đứng ngoài. Nếu đã khớp: không tăng vị thế và giữ đúng SL."
+                )
+            message = (
+                verdict
+                + "\n\n"
+                + format_peak_ai_review(review, used_label, gate)
+            )
+        else:
+            message = (
+                f"⚠️ AI XÁC THỰC {side} KHÔNG KHẢ DỤNG\n"
+                f"• {unavailable_reason or 'AI không phản hồi'}.\n"
+                "• Không coi đây là AI đồng thuận; bot vẫn canh giá 15 giây và giữ nguyên SL/TP do code tính."
+            )
+        await context.bot.send_message(chat_id=chat_id, text=message)
+        decision_log = (
+            review.decision if review is not None else "unavailable"
+        ).encode("ascii", "backslashreplace").decode("ascii")
+        logger.info(
+            "Auto alert AI verification sent: %s model=%s decision=%s",
+            side,
+            used_label or "unavailable",
+            decision_log,
+        )
+    except Exception as exc:
+        logger.exception("Failed to send auto alert AI verification")
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"⚠️ AI XÁC THỰC {side} TẠM LỖI\n"
+                f"• {type(exc).__name__}. Không coi đây là AI đồng thuận.\n"
+                "• Bot vẫn canh giá 15 giây; giữ đúng kế hoạch SL/TP trong cảnh báo đầu tiên."
+            ),
+        )
+
+
+async def auto_entry_alert_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    config = context.bot_data["config"]
+    settings = config.get("auto_alerts", {})
+    enabled = context.bot_data.get(
+        "auto_alert_enabled_override",
+        settings.get("enabled", True),
+    )
+    if not enabled:
+        return
+
+    lock = context.bot_data.setdefault("auto_alert_lock", asyncio.Lock())
+    if lock.locked():
+        logger.warning("Auto alert check skipped because previous check is still running")
+        return
+
+    async with lock:
+        checked_at = datetime.now(timezone.utc)
+        context.bot_data["auto_alert_last_check"] = checked_at
+        try:
+            opportunity = await asyncio.to_thread(
+                compute_peak_opportunity,
+                config,
+                context.bot_data["provider"],
+                context.bot_data["price_stream"],
+                checked_at,
+            )
+            context.bot_data["auto_alert_last_error"] = None
+            context.bot_data["auto_alert_last_gate"] = opportunity.gate.allowed_decision
+            context.bot_data["auto_alert_last_reason"] = opportunity.gate.reason
+            active_wave = _get_active_wave(context, settings)
+            if active_wave is not None:
+                end_event, end_detail = _full_scan_wave_end_event(
+                    active_wave,
+                    opportunity,
+                    settings,
+                )
+                if end_event is not None:
+                    end_price = _wave_price(
+                        active_wave,
+                        opportunity.realtime_quote,
+                        entering=False,
+                    )
+                    await context.bot.send_message(
+                        chat_id=context.bot_data["authorized_chat_id"],
+                        text=_format_active_wave_alert(
+                            end_event,
+                            active_wave,
+                            end_price,
+                            end_detail,
+                        ),
+                    )
+                    _set_active_wave(context, settings, None)
+                    active_wave = None
+            phase, executable_price = _auto_alert_phase(opportunity, settings)
+            if phase is None:
+                logger.debug(
+                    "Auto alert check: gate=%s reason=%s",
+                    opportunity.gate.allowed_decision.encode(
+                        "ascii", "backslashreplace"
+                    ).decode("ascii"),
+                    opportunity.gate.reason.encode(
+                        "ascii", "backslashreplace"
+                    ).decode("ascii"),
+                )
+                return
+
+            plan = opportunity.execution_plan
+            if plan is None:
+                return
+            fingerprint = _auto_alert_fingerprint(plan, phase)
+            state_path = settings.get("state_path", "logs/auto_alert_state.json")
+            state = _load_auto_alert_state(state_path)
+            sent = state.get("sent", {}) if isinstance(state.get("sent", {}), dict) else {}
+            cooldown = timedelta(
+                minutes=max(1, int(settings.get("same_setup_cooldown_minutes", 240)))
+            )
+            last_sent_raw = sent.get(fingerprint)
+            if last_sent_raw:
+                try:
+                    last_sent = datetime.fromisoformat(last_sent_raw)
+                    if last_sent.tzinfo is None:
+                        last_sent = last_sent.replace(tzinfo=timezone.utc)
+                    if checked_at - last_sent < cooldown:
+                        return
+                except ValueError:
+                    pass
+
+            chat_id = context.bot_data["authorized_chat_id"]
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=format_auto_entry_alert(
+                    opportunity,
+                    phase,
+                    executable_price,
+                ),
+            )
+            if settings.get("send_hourly_chart", True):
+                try:
+                    chart = await asyncio.to_thread(
+                        render_peak_confirmation_chart,
+                        opportunity.frames,
+                        opportunity.peak_map,
+                        opportunity.liquidity,
+                    )
+                    await context.bot.send_photo(
+                        chat_id=chat_id,
+                        photo=chart,
+                        caption="AUTO XAUUSDT · 15m Entry / 1H xác nhận / D1 xu hướng.",
+                    )
+                except Exception:
+                    logger.exception("Auto alert text sent but 1H chart failed")
+
+            cutoff = checked_at - timedelta(hours=48)
+            retained = {}
+            for key, value in sent.items():
+                try:
+                    value_time = datetime.fromisoformat(value)
+                    if value_time.tzinfo is None:
+                        value_time = value_time.replace(tzinfo=timezone.utc)
+                    if value_time >= cutoff:
+                        retained[key] = value
+                except (TypeError, ValueError):
+                    continue
+            retained[fingerprint] = checked_at.isoformat()
+            state["sent"] = retained
+            state["last_alert"] = {
+                "at": checked_at.isoformat(),
+                "side": plan.side,
+                "phase": phase,
+                "entry": [plan.entry_lower, plan.entry_upper],
+            }
+            request_ai_review = False
+            if active_wave is None:
+                active_wave = _build_active_wave(
+                    opportunity,
+                    phase,
+                    checked_at,
+                    settings,
+                )
+                context.bot_data["active_wave"] = active_wave
+            if (
+                settings.get("ai_review_after_alert", True)
+                and not active_wave.get("ai_review_requested_at")
+            ):
+                active_wave["ai_review_requested_at"] = checked_at.isoformat()
+                request_ai_review = True
+            state["active_wave"] = active_wave
+            _save_auto_alert_state(state_path, state)
+            context.bot_data["auto_alert_last_sent"] = checked_at
+            logger.info("Auto entry alert sent: %s %s", plan.side, phase)
+            if request_ai_review:
+                context.job_queue.run_once(
+                    auto_alert_ai_review_job,
+                    when=0,
+                    data={
+                        "chat_id": chat_id,
+                        "side": plan.side,
+                        "gate": opportunity.gate,
+                        "snapshot": _build_auto_peak_ai_snapshot(opportunity),
+                    },
+                    name=(
+                        "xauusdt-auto-ai-review-"
+                        + checked_at.strftime("%Y%m%d%H%M%S%f")
+                    ),
+                )
+        except Exception as exc:
+            context.bot_data["auto_alert_last_error"] = (
+                f"{type(exc).__name__}: {exc}"
+            )
+            logger.exception("Auto entry alert check failed")
+
+
+async def active_wave_monitor_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Watch an alerted setup every 15s without calling any LLM."""
+    config = context.bot_data["config"]
+    settings = config.get("auto_alerts", {})
+    enabled = context.bot_data.get(
+        "auto_alert_enabled_override",
+        settings.get("enabled", True),
+    )
+    if not enabled:
+        return
+    retry_after = context.bot_data.get("active_wave_retry_after")
+    if retry_after is not None and datetime.now(timezone.utc) < retry_after:
+        return
+    active_wave = _get_active_wave(context, settings)
+    if active_wave is None:
+        return
+
+    lock = context.bot_data.setdefault("auto_alert_lock", asyncio.Lock())
+    if lock.locked():
+        return
+    async with lock:
+        checked_at = datetime.now(timezone.utc)
+        try:
+            quote = await asyncio.to_thread(
+                get_fast_quote,
+                context.bot_data["provider"],
+                context.bot_data["price_stream"],
+            )
+            context.bot_data["active_wave_last_error"] = None
+            context.bot_data["active_wave_retry_after"] = None
+            active_wave = _get_active_wave(context, settings)
+            if active_wave is None:
+                return
+            price = _wave_price(
+                active_wave,
+                quote,
+                entering=not bool(active_wave.get("entered")),
+            )
+            active_wave["last_check_at"] = checked_at.isoformat()
+            active_wave["last_price"] = price
+            context.bot_data["active_wave_last_check"] = checked_at
+            event = _fast_wave_event(active_wave, price, settings)
+            detail = ""
+
+            if event is None and active_wave.get("entered"):
+                pressure_score, monotonic_opposite, fetched = await asyncio.to_thread(
+                    _refresh_micro_pressure,
+                    context.bot_data["provider"],
+                    active_wave,
+                    checked_at,
+                    settings,
+                )
+                threshold = max(
+                    0.1,
+                    float(settings.get("micro_weakness_threshold", 0.35)),
+                )
+                adverse_r = max(
+                    0.1,
+                    float(settings.get("adverse_warning_r", 0.35)),
+                )
+                progress_r = _wave_progress_r(active_wave, price)
+                pressure_opposite = (
+                    pressure_score is not None
+                    and (
+                        pressure_score <= -threshold
+                        if active_wave["side"] == "LONG"
+                        else pressure_score >= threshold
+                    )
+                )
+                if (
+                    not active_wave.get("weakness_notified")
+                    and progress_r <= -adverse_r
+                    and pressure_opposite
+                    and monotonic_opposite
+                ):
+                    event = "WEAK"
+                    detail = (
+                        f"Áp lực nến 1m đang ngược kèo "
+                        f"({float(pressure_score):+.2f})."
+                    )
+                if fetched:
+                    _set_active_wave(context, settings, active_wave)
+
+            if event is None:
+                context.bot_data["active_wave"] = active_wave
+                return
+
+            if event == "ENTRY":
+                active_wave["entered"] = True
+                active_wave["phase"] = "ACTIVE"
+                active_wave["entered_at"] = checked_at.isoformat()
+                holding = min(
+                    max(1, int(active_wave.get("max_holding_minutes", 240))),
+                    max(1, int(settings.get("active_wave_max_minutes", 480))),
+                )
+                active_wave["expires_at"] = (
+                    checked_at + timedelta(minutes=holding)
+                ).isoformat()
+            elif event == "TP1":
+                active_wave["tp1_notified"] = True
+            elif event == "WEAK":
+                active_wave["weakness_notified"] = True
+
+            await context.bot.send_message(
+                chat_id=context.bot_data["authorized_chat_id"],
+                text=_format_active_wave_alert(
+                    event,
+                    active_wave,
+                    price,
+                    detail,
+                ),
+            )
+            terminal_events = {
+                "TP2",
+                "BREAKEVEN",
+                "STOP",
+                "INVALIDATED",
+                "RUNAWAY",
+                "EXPIRED",
+                "TIME_STOP",
+            }
+            _set_active_wave(
+                context,
+                settings,
+                None if event in terminal_events else active_wave,
+            )
+            logger.info("Active wave event sent: %s %s", active_wave["side"], event)
+        except Exception as exc:
+            context.bot_data["active_wave_last_error"] = (
+                f"{type(exc).__name__}: {exc}"
+            )
+            context.bot_data["active_wave_retry_after"] = (
+                datetime.now(timezone.utc)
+                + timedelta(
+                    seconds=max(15, int(settings.get("error_backoff_seconds", 60)))
+                )
+            )
+            logger.exception("Active wave 15-second check failed")
+
+
+async def auto_monitor_startup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings = context.bot_data["config"].get("auto_alerts", {})
+    if not settings.get("enabled", True) or not settings.get("notify_on_start", True):
+        return
+    await context.bot.send_message(
+        chat_id=context.bot_data["authorized_chat_id"],
+        text=(
+            "✅ CANH TỰ ĐỘNG XAUUSDT ĐÃ BẬT\n"
+            f"• Kiểm tra mỗi {int(settings.get('poll_seconds', 60))} giây.\n"
+            f"• Sau khi báo LONG/SHORT: canh giá mỗi {int(settings.get('active_poll_seconds', 15))} giây; AI không bị gọi nền.\n"
+            "• Chỉ báo khi đủ 15m + 1H + 4H, D1 không đối nghịch, thanh khoản đạt và giá sát/vào Entry.\n"
+            "• Cuối tuần mặc định không phát cảnh báo vào lệnh.\n"
+            "• Dùng /canh để xem trạng thái; /canhtat hoặc /canhbat để điều khiển."
+        ),
+    )
+
+
+async def handle_auto_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings = context.bot_data["config"].get("auto_alerts", {})
+    enabled = context.bot_data.get(
+        "auto_alert_enabled_override",
+        settings.get("enabled", True),
+    )
+    last_check = context.bot_data.get("auto_alert_last_check")
+    last_sent = context.bot_data.get("auto_alert_last_sent")
+    last_error = context.bot_data.get("auto_alert_last_error")
+    last_gate = context.bot_data.get("auto_alert_last_gate", "chưa kiểm tra")
+    last_reason = context.bot_data.get("auto_alert_last_reason", "chưa có dữ liệu")
+    active_wave = _get_active_wave(context, settings)
+    if active_wave is not None:
+        wave_last_check = _parse_utc(active_wave.get("last_check_at"))
+        wave_status = (
+            f"{active_wave['side']} · "
+            f"{'đang trong lệnh' if active_wave.get('entered') else 'chờ Entry'} · "
+            f"giá gần nhất {float(active_wave.get('last_price', 0)):.2f} · "
+            f"check {wave_last_check.astimezone().strftime('%H:%M:%S') if wave_last_check else 'chưa có'}"
+        )
+    else:
+        wave_status = "không có kèo đang canh nhanh"
+    await update.message.reply_text(
+        "\n".join(
+            [
+                f"🔔 Canh tự động: {'ĐANG BẬT' if enabled else 'ĐANG TẮT'}",
+                f"• Chu kỳ: {int(settings.get('poll_seconds', 60))} giây.",
+                f"• Canh nhanh: {int(settings.get('active_poll_seconds', 15))} giây — {wave_status}.",
+                f"• Lần kiểm tra: {last_check.astimezone().strftime('%d/%m %H:%M:%S') if last_check else 'chưa chạy'}.",
+                f"• Gate gần nhất: {last_gate} — {last_reason}",
+                f"• Cảnh báo gần nhất: {last_sent.astimezone().strftime('%d/%m %H:%M:%S') if last_sent else 'chưa có'}.",
+                f"• Lỗi gần nhất: {last_error or 'không có'}.",
+            ]
+        )
+    )
+
+
+async def handle_auto_on(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.bot_data["auto_alert_enabled_override"] = True
+    await update.message.reply_text("✅ Đã bật canh tự động; bot sẽ kiểm tra ở chu kỳ kế tiếp.")
+
+
+async def handle_auto_off(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.bot_data["auto_alert_enabled_override"] = False
+    await update.message.reply_text("⏸ Đã tắt canh tự động. /gia và /dinh vẫn dùng bình thường.")
+
+
 async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "Bot phân tích Binance Futures XAUUSDT.\n"
         "• /gia hoặc /signal: kịch bản giao dịch đã xác nhận.\n"
-        "• /dinh: bản đồ đỉnh cũ/mới, cản trên và hỗ trợ retest."
+        "• /dinh: bản đồ đỉnh cũ/mới, cản trên và hỗ trợ retest.\n"
+        "• /canh: trạng thái canh tự động; /canhbat hoặc /canhtat để điều khiển."
     )
 
 
@@ -1392,15 +2526,52 @@ def main() -> None:
     app.bot_data["config"] = config
     app.bot_data["provider"] = provider
     app.bot_data["price_stream"] = price_stream
+    app.bot_data["authorized_chat_id"] = authorized_chat_id
 
     chat_filter = filters.Chat(chat_id=authorized_chat_id)
     app.add_handler(CommandHandler("start", handle_start, filters=chat_filter))
     app.add_handler(CommandHandler(["signal", "gia"], handle_signal, filters=chat_filter))
     app.add_handler(CommandHandler("dinh", handle_peaks, filters=chat_filter))
+    app.add_handler(CommandHandler("canh", handle_auto_status, filters=chat_filter))
+    app.add_handler(CommandHandler("canhbat", handle_auto_on, filters=chat_filter))
+    app.add_handler(CommandHandler("canhtat", handle_auto_off, filters=chat_filter))
+
+    auto_settings = config.get("auto_alerts", {})
+    if auto_settings.get("enabled", True):
+        poll_seconds = max(15, int(auto_settings.get("poll_seconds", 60)))
+        first_check_seconds = max(
+            1,
+            int(auto_settings.get("first_check_seconds", 10)),
+        )
+        app.job_queue.run_repeating(
+            auto_entry_alert_job,
+            interval=poll_seconds,
+            first=first_check_seconds,
+            name="xauusdt-auto-entry-alert",
+        )
+        active_poll_seconds = max(
+            5,
+            int(auto_settings.get("active_poll_seconds", 15)),
+        )
+        app.job_queue.run_repeating(
+            active_wave_monitor_job,
+            interval=active_poll_seconds,
+            first=max(2, min(active_poll_seconds, first_check_seconds + 2)),
+            name="xauusdt-active-wave-monitor",
+        )
+        if auto_settings.get("notify_on_start", True):
+            app.job_queue.run_once(
+                auto_monitor_startup_job,
+                when=3,
+                name="xauusdt-auto-monitor-started",
+            )
 
     logger.info(
-        "Telegram query bot started for chat_id=%s, waiting for /signal, /gia or /dinh...",
+        "Telegram query bot started for chat_id=%s; auto alerts=%s interval=%ss active=%ss",
         authorized_chat_id,
+        auto_settings.get("enabled", True),
+        int(auto_settings.get("poll_seconds", 60)),
+        int(auto_settings.get("active_poll_seconds", 15)),
     )
     try:
         app.run_polling()
