@@ -74,7 +74,7 @@ os.makedirs("logs", exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.FileHandler("logs/telegram_query_bot.log"), logging.StreamHandler()],
+    handlers=[logging.StreamHandler()],
 )
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("apscheduler").setLevel(logging.WARNING)
@@ -2439,7 +2439,7 @@ async def auto_monitor_startup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             f"• Kiểm tra mỗi {int(settings.get('poll_seconds', 60))} giây.\n"
             f"• Sau khi báo LONG/SHORT: canh giá mỗi {int(settings.get('active_poll_seconds', 15))} giây; AI không bị gọi nền.\n"
             "• Chỉ báo khi đủ 15m + 1H + 4H, D1 không đối nghịch, thanh khoản đạt và giá sát/vào Entry.\n"
-            "• Cuối tuần mặc định không phát cảnh báo vào lệnh.\n"
+            "• Từ 05:00 thứ Bảy đến hết Chủ Nhật không phát cảnh báo vào lệnh.\n"
             "• Dùng /canh để xem trạng thái; /canhtat hoặc /canhbat để điều khiển."
         ),
     )

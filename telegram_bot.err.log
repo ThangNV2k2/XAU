@@ -1,4 +1,0 @@
-2026-07-26 23:18:41,247 [INFO] Websocket connected
-2026-07-26 23:18:41,249 [INFO] Binance Futures WebSocket connected for XAUUSDT
-2026-07-26 23:18:41,259 [INFO] Telegram query bot started for chat_id=8948213315; auto alerts=True interval=60s active=15s
-2026-07-26 23:18:42,114 [INFO] Application started

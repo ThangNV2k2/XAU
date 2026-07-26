@@ -6,3 +6,4 @@ venv/
 backtest/cache/
 backtest/*.png
 logs/
+*.log

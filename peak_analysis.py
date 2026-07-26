@@ -21,6 +21,21 @@ TIMEFRAME_WEIGHTS = {
     "4h": 5,
     "1day": 7,
 }
+VIETNAM_TIMEZONE = ZoneInfo("Asia/Ho_Chi_Minh")
+
+
+def is_weekend_entry_blackout(
+    analysis_now: datetime,
+    cutoff_hour_vn: int = 5,
+) -> bool:
+    """Block new entries from Saturday cutoff through the end of Sunday in Vietnam."""
+    if analysis_now.tzinfo is None:
+        analysis_now = analysis_now.replace(tzinfo=timezone.utc)
+    local_now = analysis_now.astimezone(VIETNAM_TIMEZONE)
+    cutoff_hour = max(0, min(23, int(cutoff_hour_vn)))
+    return local_now.weekday() == 6 or (
+        local_now.weekday() == 5 and local_now.hour >= cutoff_hour
+    )
 
 
 @dataclass(frozen=True)
@@ -465,8 +480,10 @@ def assess_peak_liquidity(
     analysis_now = analysis_now or datetime.now(timezone.utc)
     if analysis_now.tzinfo is None:
         analysis_now = analysis_now.replace(tzinfo=timezone.utc)
-    local_now = analysis_now.astimezone(ZoneInfo("Asia/Bangkok"))
-    is_weekend = local_now.weekday() >= 5
+    is_weekend = is_weekend_entry_blackout(
+        analysis_now,
+        settings.get("weekend_cutoff_hour_vn", 5),
+    )
 
     volume_column = (
         "quote_volume"

@@ -85,6 +85,8 @@ peak_execution:
 
 peak_liquidity:
   block_weekend_entries: true
+  # Cho phep Entry den truoc 05:00 sang thu Bay, theo gio Viet Nam.
+  weekend_cutoff_hour_vn: 5
   recent_volume_hours: 6
   volume_baseline_hours: 168
   minimum_volume_ratio: 0.45
