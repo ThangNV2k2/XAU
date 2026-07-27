@@ -52,7 +52,7 @@ Một tiến trình `telegram_query_bot.py` vừa trả lời lệnh, vừa tự
    ```bash
    python telegram_query_bot.py
    ```
-   Ngay khi khởi động, bot gửi `CANH TỰ ĐỘNG XAUUSDT ĐÃ BẬT`. Mặc định bot kiểm tra mỗi 60 giây nhưng chỉ cảnh báo khi cùng logic với `/dinh` đã xác nhận, giá sát/vào vùng Entry và kế hoạch có R:R hợp lệ.
+   Ngay khi khởi động, bot gửi `CANH TỰ ĐỘNG XAUUSDT ĐÃ BẬT`. Mặc định bot kiểm tra mỗi 30 giây nhưng chỉ cảnh báo khi cùng logic với `/dinh` đã xác nhận, giá sát/vào vùng Entry và kế hoạch có R:R hợp lệ.
    - `/canh` — xem lần kiểm tra, gate/lý do và lỗi gần nhất.
    - `/canhbat` / `/canhtat` — bật hoặc tắt canh nền mà không dừng bot.
    - Cùng một setup được chống gửi lặp; có thể báo hai giai đoạn `SÁT ENTRY` và `ĐÃ VÀO ENTRY`.
@@ -104,8 +104,9 @@ python main.py             # chạy thật, đẩy tin khi tín hiệu đổi tr
 - `resistance_test` — độ gom cụm swing theo ATR, độ rộng vùng và các ngưỡng kiểm tra từ chối giá.
 - `peak_map` — các khung của `/dinh`, span Fractal, deviation ZigZag, độ gom vùng và số vùng tối đa cần hiển thị.
 - `peak_execution` — đệm Entry/SL theo ATR và R:R cấu trúc tối thiểu trước khi `/dinh` được phép sinh kế hoạch.
+- SL cấu trúc bị giới hạn tối đa khoảng 7 giá tính từ mọi điểm khớp trong vùng Entry; nếu cần xa hơn bot bỏ kèo. Sau khi khớp, nến 1m đóng sai phía vùng retest kèm áp lực ngược sẽ phát cảnh báo `RETEST THẤT BẠI — CẮT NGAY`, không chờ hard SL.
 - `peak_liquidity` — tỷ lệ volume tối thiểu, spread tối đa và chính sách chặn Entry cuối tuần.
-- `auto_alerts` — quét cấu trúc nền mỗi 60 giây; khi có setup LONG/SHORT bot gửi cảnh báo code ngay, gọi AI ở tác vụ riêng để gửi thông báo xác thực thứ hai, rồi canh giá mỗi 15 giây. Nến 1m cập nhật mỗi phút; vòng canh nhanh không gọi AI.
+- `auto_alerts` — quét cấu trúc nền mỗi 30 giây; khi có setup LONG/SHORT bot gửi cảnh báo code ngay, gọi AI ở tác vụ riêng để gửi thông báo xác thực thứ hai, rồi canh giá mỗi 10 giây. Nến 1m cập nhật mỗi phút; vòng canh nhanh không gọi AI.
 
 ## 6. Cấu trúc project
 

@@ -872,6 +872,26 @@ def build_peak_execution_plan(
     if risk_distance <= 0 or reward_2 <= 0:
         return None, "Vùng Entry/SL/TP không đúng thứ tự giá; bỏ thiết lập này."
 
+    maximum_stop_distance = max(
+        0.0,
+        float(settings.get("maximum_stop_distance", 7.0)),
+    )
+    worst_fill_stop_distance = (
+        entry_upper - stop_loss
+        if direction == 1
+        else stop_loss - entry_lower
+    )
+    if (
+        maximum_stop_distance > 0
+        and worst_fill_stop_distance > maximum_stop_distance + tick / 2
+    ):
+        return (
+            None,
+            f"Bỏ lệnh: SL đúng cấu trúc cần cách Entry tối đa "
+            f"{worst_fill_stop_distance:.2f} giá, vượt giới hạn "
+            f"{maximum_stop_distance:.2f} giá. Không kéo SL vào trong cấu trúc.",
+        )
+
     reward_risk_2 = reward_2 / risk_distance
     if reward_risk_2 < minimum_structural_rr:
         return (

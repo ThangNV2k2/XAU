@@ -82,6 +82,8 @@ peak_execution:
   stop_buffer_atr: 0.20
   minimum_structural_rr: 1.5
   take_profit_1_r: 1.0
+  # SL dung theo cau truc, nhung neu xa hon 7 gia tu bat ky diem khop trong Entry thi bo keo.
+  maximum_stop_distance: 7.0
 
 peak_liquidity:
   block_weekend_entries: true
@@ -94,9 +96,9 @@ peak_liquidity:
 
 auto_alerts:
   enabled: true
-  poll_seconds: 60
+  poll_seconds: 30
   # Quet gia nhanh chi sau khi da phat setup LONG/SHORT; vong nay khong goi AI.
-  active_poll_seconds: 15
+  active_poll_seconds: 10
   first_check_seconds: 10
   notify_on_start: true
   notify_approaching: true
@@ -108,6 +110,10 @@ auto_alerts:
   active_wave_max_minutes: 480
   micro_candle_bars: 30
   micro_weakness_threshold: 0.35
+  # Cat som khi nen 1m sau Entry dong sai phia vung retest kem ap luc nguoc.
+  retest_failure_buffer_price: 0.50
+  retest_failure_buffer_r: 0.05
+  retest_failure_pressure_threshold: 0.20
   adverse_warning_r: 0.35
   runaway_cancel_r: 0.50
   structure_flip_threshold: 0.15

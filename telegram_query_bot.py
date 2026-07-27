@@ -399,6 +399,8 @@ def format_peak_execution_guide(
             f"{resistance.lower:.2f}–{resistance.upper:.2f}, 1H đóng trên cản và D1 không giảm mạnh.",
             "• Lúc này chưa đặt Limit/SL/TP. Đủ điều kiện thì gọi /dinh lại; râu nến không tính xác nhận.",
             "• Khi bot có kế hoạch: Entry bằng Limit → khớp xong mới đặt Stop-Market toàn vị thế, trigger Mark Price.",
+            "• Luật SL: tối đa khoảng 7 giá từ Entry thực tế; nếu cấu trúc cần xa hơn thì BỎ KÈO, không ép SL sai vị trí.",
+            "• Retest thất bại sau khi khớp: cắt sớm ngay khi bot báo; không cố chờ giá chạy đủ 7 giá mới thoát.",
             "• TP1 đóng 50%, TP2 đóng phần còn lại; cả hai phải là Close/Reduce-Only để không mở lệnh ngược.",
         ]
         return "\n".join(lines)
@@ -411,11 +413,14 @@ def format_peak_execution_guide(
     )
     entry_button = "Mua/Long" if plan.side == "LONG" else "Bán/Short"
     close_button = "Bán/Close Long" if plan.side == "LONG" else "Mua/Close Short"
+    stop_distance = abs(plan.entry_reference - plan.stop_loss)
     lines += [
         f"• {plan.side}: chờ giá quay lại {plan.entry_lower:.2f}–{plan.entry_upper:.2f} "
         f"và nến 15m retest {retest_action}; 1H xác nhận, D1 không đối nghịch, không đuổi giá.",
-        f"• Entry tham chiếu {plan.entry_reference:.2f} · SL {plan.stop_loss:.2f} "
-        "(Stop-Market, ưu tiên trigger Mark Price).",
+        f"• CẮT LỖ CỨNG: SL {plan.stop_loss:.2f}, cách Entry tham chiếu "
+        f"{stop_distance:.2f} giá (không quá khoảng 7 giá).",
+        "• Không chờ bot để cắt SL: Entry khớp là đặt Stop-Market ngay trên Binance, ưu tiên trigger Mark Price.",
+        "• RETEST THẤT BẠI: nếu nến 1m đóng xuyên mép sai của vùng Entry kèm áp lực ngược, bot báo CẮT NGAY; đóng toàn bộ Reduce-Only, không chờ hard SL.",
         f"• TP1 {plan.take_profit_1:.2f} ({plan.reward_risk_1:.1f}R) · "
         f"TP2 {plan.take_profit_2:.2f} ({plan.reward_risk_2:.1f}R, {plan.structural_target}).",
     ]
@@ -431,11 +436,12 @@ def format_peak_execution_guide(
             "CÁCH ĐẶT TRÊN BINANCE",
             f"1) Chọn Isolated {sized_plan.leverage}x → Limit {entry_button} "
             f"{sized_plan.quantity_xau:.3f} XAU trong vùng Entry; hết vùng thì hủy, không Market đuổi.",
-            f"2) Sau khi Entry khớp → đặt Stop-Market {close_button} toàn bộ vị thế tại "
-            f"{plan.stop_loss:.2f}; trigger Mark Price và chọn Close Position/Reduce-Only nếu giao diện có.",
+            f"2) NGAY KHI Entry khớp → đặt Stop-Market {close_button} toàn bộ vị thế tại "
+            f"{plan.stop_loss:.2f}; trigger Mark Price và chọn Close Position/Reduce-Only. Không đặt SL sau.",
             f"3) Đặt TP Limit {close_button}: 50% tại {plan.take_profit_1:.2f}; "
             f"phần còn lại tại {plan.take_profit_2:.2f}, đều chỉ giảm vị thế.",
-            "4) TP1 khớp → dời SL phần còn lại về Entry; vị thế đã đóng thì hủy mọi lệnh SL/TP còn treo.",
+            "4) Nếu bot báo RETEST THẤT BẠI → Market Close/Close Position toàn bộ ngay, Reduce-Only; hủy TP/SL còn treo và không đảo chiều.",
+            "5) TP1 khớp → dời SL phần còn lại về Entry; vị thế đã đóng thì hủy mọi lệnh SL/TP còn treo.",
         ]
     else:
         lines.append("• Không tính được khối lượng an toàn với số dư/cấu hình hiện tại; không vào lệnh.")
@@ -1627,6 +1633,8 @@ def _build_active_wave(
         "pressure_score": None,
         "pressure_label": None,
         "micro_monotonic_opposite": False,
+        "last_micro_close": None,
+        "last_micro_closed_at": None,
     }
 
 
@@ -1690,6 +1698,7 @@ def _format_active_wave_alert(
     active_wave: dict,
     price: float,
     detail: str = "",
+    active_poll_seconds: int = 10,
 ) -> str:
     side = active_wave["side"]
     entry_lower = float(active_wave["entry_lower"])
@@ -1704,13 +1713,20 @@ def _format_active_wave_alert(
             f"🚨 KÈO {side} ĐÃ KÍCH HOẠT\n"
             f"• Giá {price:.2f} đã vào Entry {entry_lower:.2f}–{entry_upper:.2f}.\n"
             f"• SL {stop:.2f} · TP1 {tp1:.2f} · TP2 {tp2:.2f}.\n"
-            f"• Bot bắt đầu canh sóng mỗi 15 giây ({checked}); không Market đuổi giá."
+            f"• Bot bắt đầu canh sóng mỗi {active_poll_seconds} giây ({checked}); không Market đuổi giá."
         )
     if event == "WEAK":
         return (
             f"⚠️ SÓNG {side} ĐANG YẾU\n"
             f"• Giá {price:.2f} · tiến độ {progress:+.2f}R. {detail}\n"
             "• Không thêm lệnh; giữ đúng SL và chờ xác nhận 15m. Chưa coi là kết thúc sóng."
+        )
+    if event == "RETEST_FAILED":
+        return (
+            f"🛑🛑 RETEST {side} THẤT BẠI — CẮT NGAY\n"
+            f"• Giá hiện tại {price:.2f}. {detail}\n"
+            "• Đóng TOÀN BỘ bằng Market Close/Close Position và Reduce-Only; hủy TP/SL còn treo.\n"
+            "• Không chờ hard SL, không gồng và không tự động đảo chiều."
         )
     if event == "TP1":
         return (
@@ -1809,14 +1825,16 @@ def _refresh_micro_pressure(
     active_wave: dict,
     checked_at: datetime,
     settings: dict,
-) -> tuple[float | None, bool, bool]:
-    """Fetch closed 1m candles once per minute, not on every 15-second tick."""
+) -> tuple[float | None, bool, bool, float | None, datetime | None]:
+    """Fetch closed 1m candles once per minute, not on every fast price tick."""
     current_bucket = checked_at.replace(second=0, microsecond=0).isoformat()
     if active_wave.get("last_micro_bucket") == current_bucket:
         return (
             active_wave.get("pressure_score"),
             bool(active_wave.get("micro_monotonic_opposite")),
             False,
+            active_wave.get("last_micro_close"),
+            _parse_utc(active_wave.get("last_micro_closed_at")),
         )
     bars = max(10, min(100, int(settings.get("micro_candle_bars", 30))))
     frame = select_closed_candles(
@@ -1836,7 +1854,74 @@ def _refresh_micro_pressure(
     active_wave["pressure_score"] = pressure.score
     active_wave["pressure_label"] = pressure.label
     active_wave["micro_monotonic_opposite"] = monotonic_opposite
-    return pressure.score, monotonic_opposite, True
+    last_micro_close = float(frame["close"].iloc[-1])
+    last_micro_closed_at = frame.index[-1].to_pydatetime() + timedelta(minutes=1)
+    if last_micro_closed_at.tzinfo is None:
+        last_micro_closed_at = last_micro_closed_at.replace(tzinfo=timezone.utc)
+    else:
+        last_micro_closed_at = last_micro_closed_at.astimezone(timezone.utc)
+    active_wave["last_micro_close"] = last_micro_close
+    active_wave["last_micro_closed_at"] = last_micro_closed_at.isoformat()
+    return (
+        pressure.score,
+        monotonic_opposite,
+        True,
+        last_micro_close,
+        last_micro_closed_at,
+    )
+
+
+def _micro_retest_failure(
+    active_wave: dict,
+    pressure_score: float | None,
+    last_micro_close: float | None,
+    last_micro_closed_at: datetime | None,
+    settings: dict,
+) -> tuple[bool, str]:
+    """Confirm an early retest failure only with a post-entry closed 1m candle."""
+    entered_at = _parse_utc(active_wave.get("entered_at"))
+    if (
+        entered_at is None
+        or last_micro_close is None
+        or last_micro_closed_at is None
+        or last_micro_closed_at <= entered_at
+        or pressure_score is None
+    ):
+        return False, ""
+    buffer_price = max(
+        0.0,
+        float(settings.get("retest_failure_buffer_price", 0.50)),
+        _wave_r(active_wave)
+        * max(0.0, float(settings.get("retest_failure_buffer_r", 0.05))),
+    )
+    pressure_threshold = max(
+        0.05,
+        float(settings.get("retest_failure_pressure_threshold", 0.20)),
+    )
+    side = active_wave["side"]
+    lower = float(active_wave["entry_lower"])
+    upper = float(active_wave["entry_upper"])
+    if (
+        side == "LONG"
+        and last_micro_close < lower - buffer_price
+        and pressure_score <= -pressure_threshold
+    ):
+        return (
+            True,
+            f"Nến 1m đóng {last_micro_close:.2f} dưới vùng Entry "
+            f"{lower:.2f} với áp lực bán {pressure_score:+.2f}.",
+        )
+    if (
+        side == "SHORT"
+        and last_micro_close > upper + buffer_price
+        and pressure_score >= pressure_threshold
+    ):
+        return (
+            True,
+            f"Nến 1m đóng {last_micro_close:.2f} trên vùng Entry "
+            f"{upper:.2f} với áp lực mua {pressure_score:+.2f}.",
+        )
+    return False, ""
 
 
 def _full_scan_wave_end_event(
@@ -2060,7 +2145,11 @@ async def auto_alert_ai_review_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     gate = data["gate"]
     side = data["side"]
     try:
-        ai_config = context.bot_data["config"].get("ai_analysis", {})
+        config = context.bot_data["config"]
+        ai_config = config.get("ai_analysis", {})
+        active_poll_seconds = int(
+            config.get("auto_alerts", {}).get("active_poll_seconds", 10)
+        )
         review, used_label, unavailable_reason = await asyncio.wait_for(
             _request_auto_peak_ai_review(
                 context,
@@ -2092,7 +2181,7 @@ async def auto_alert_ai_review_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             message = (
                 f"⚠️ AI XÁC THỰC {side} KHÔNG KHẢ DỤNG\n"
                 f"• {unavailable_reason or 'AI không phản hồi'}.\n"
-                "• Không coi đây là AI đồng thuận; bot vẫn canh giá 15 giây và giữ nguyên SL/TP do code tính."
+                f"• Không coi đây là AI đồng thuận; bot vẫn canh giá {active_poll_seconds} giây và giữ nguyên SL/TP do code tính."
             )
         await context.bot.send_message(chat_id=chat_id, text=message)
         decision_log = (
@@ -2111,7 +2200,7 @@ async def auto_alert_ai_review_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             text=(
                 f"⚠️ AI XÁC THỰC {side} TẠM LỖI\n"
                 f"• {type(exc).__name__}. Không coi đây là AI đồng thuận.\n"
-                "• Bot vẫn canh giá 15 giây; giữ đúng kế hoạch SL/TP trong cảnh báo đầu tiên."
+                f"• Bot vẫn canh giá {active_poll_seconds} giây; giữ đúng kế hoạch SL/TP trong cảnh báo đầu tiên."
             ),
         )
 
@@ -2165,6 +2254,7 @@ async def auto_entry_alert_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                             active_wave,
                             end_price,
                             end_detail,
+                            int(settings.get("active_poll_seconds", 10)),
                         ),
                     )
                     _set_active_wave(context, settings, None)
@@ -2289,7 +2379,7 @@ async def auto_entry_alert_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def active_wave_monitor_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Watch an alerted setup every 15s without calling any LLM."""
+    """Watch an alerted setup on the configured fast loop without any LLM call."""
     config = context.bot_data["config"]
     settings = config.get("auto_alerts", {})
     enabled = context.bot_data.get(
@@ -2333,7 +2423,13 @@ async def active_wave_monitor_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             detail = ""
 
             if event is None and active_wave.get("entered"):
-                pressure_score, monotonic_opposite, fetched = await asyncio.to_thread(
+                (
+                    pressure_score,
+                    monotonic_opposite,
+                    fetched,
+                    last_micro_close,
+                    last_micro_closed_at,
+                ) = await asyncio.to_thread(
                     _refresh_micro_pressure,
                     context.bot_data["provider"],
                     active_wave,
@@ -2357,7 +2453,17 @@ async def active_wave_monitor_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                         else pressure_score >= threshold
                     )
                 )
-                if (
+                retest_failed, retest_detail = _micro_retest_failure(
+                    active_wave,
+                    pressure_score,
+                    last_micro_close,
+                    last_micro_closed_at,
+                    settings,
+                )
+                if fetched and retest_failed:
+                    event = "RETEST_FAILED"
+                    detail = retest_detail
+                elif (
                     not active_wave.get("weakness_notified")
                     and progress_r <= -adverse_r
                     and pressure_opposite
@@ -2398,12 +2504,14 @@ async def active_wave_monitor_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                     active_wave,
                     price,
                     detail,
+                    int(settings.get("active_poll_seconds", 10)),
                 ),
             )
             terminal_events = {
                 "TP2",
                 "BREAKEVEN",
                 "STOP",
+                "RETEST_FAILED",
                 "INVALIDATED",
                 "RUNAWAY",
                 "EXPIRED",
@@ -2425,7 +2533,7 @@ async def active_wave_monitor_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                     seconds=max(15, int(settings.get("error_backoff_seconds", 60)))
                 )
             )
-            logger.exception("Active wave 15-second check failed")
+            logger.exception("Active wave fast check failed")
 
 
 async def auto_monitor_startup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2436,8 +2544,8 @@ async def auto_monitor_startup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         chat_id=context.bot_data["authorized_chat_id"],
         text=(
             "✅ CANH TỰ ĐỘNG XAUUSDT ĐÃ BẬT\n"
-            f"• Kiểm tra mỗi {int(settings.get('poll_seconds', 60))} giây.\n"
-            f"• Sau khi báo LONG/SHORT: canh giá mỗi {int(settings.get('active_poll_seconds', 15))} giây; AI không bị gọi nền.\n"
+            f"• Kiểm tra mỗi {int(settings.get('poll_seconds', 30))} giây.\n"
+            f"• Sau khi báo LONG/SHORT: canh giá mỗi {int(settings.get('active_poll_seconds', 10))} giây; AI không bị gọi nền.\n"
             "• Chỉ báo khi đủ 15m + 1H + 4H, D1 không đối nghịch, thanh khoản đạt và giá sát/vào Entry.\n"
             "• Từ 05:00 thứ Bảy đến hết Chủ Nhật không phát cảnh báo vào lệnh.\n"
             "• Dùng /canh để xem trạng thái; /canhtat hoặc /canhbat để điều khiển."
@@ -2471,8 +2579,8 @@ async def handle_auto_status(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "\n".join(
             [
                 f"🔔 Canh tự động: {'ĐANG BẬT' if enabled else 'ĐANG TẮT'}",
-                f"• Chu kỳ: {int(settings.get('poll_seconds', 60))} giây.",
-                f"• Canh nhanh: {int(settings.get('active_poll_seconds', 15))} giây — {wave_status}.",
+                f"• Chu kỳ: {int(settings.get('poll_seconds', 30))} giây.",
+                f"• Canh nhanh: {int(settings.get('active_poll_seconds', 10))} giây — {wave_status}.",
                 f"• Lần kiểm tra: {last_check.astimezone().strftime('%d/%m %H:%M:%S') if last_check else 'chưa chạy'}.",
                 f"• Gate gần nhất: {last_gate} — {last_reason}",
                 f"• Cảnh báo gần nhất: {last_sent.astimezone().strftime('%d/%m %H:%M:%S') if last_sent else 'chưa có'}.",
@@ -2538,7 +2646,7 @@ def main() -> None:
 
     auto_settings = config.get("auto_alerts", {})
     if auto_settings.get("enabled", True):
-        poll_seconds = max(15, int(auto_settings.get("poll_seconds", 60)))
+        poll_seconds = max(15, int(auto_settings.get("poll_seconds", 30)))
         first_check_seconds = max(
             1,
             int(auto_settings.get("first_check_seconds", 10)),
@@ -2551,7 +2659,7 @@ def main() -> None:
         )
         active_poll_seconds = max(
             5,
-            int(auto_settings.get("active_poll_seconds", 15)),
+            int(auto_settings.get("active_poll_seconds", 10)),
         )
         app.job_queue.run_repeating(
             active_wave_monitor_job,
@@ -2570,8 +2678,8 @@ def main() -> None:
         "Telegram query bot started for chat_id=%s; auto alerts=%s interval=%ss active=%ss",
         authorized_chat_id,
         auto_settings.get("enabled", True),
-        int(auto_settings.get("poll_seconds", 60)),
-        int(auto_settings.get("active_poll_seconds", 15)),
+        int(auto_settings.get("poll_seconds", 30)),
+        int(auto_settings.get("active_poll_seconds", 10)),
     )
     try:
         app.run_polling()

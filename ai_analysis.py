@@ -409,23 +409,39 @@ def enforce_analysis_consistency(
     return analysis
 
 
+def _complete_ai_text(value: str, limit: int) -> str:
+    """Keep normal AI fields intact; only shorten pathological oversized output."""
+    value = " ".join(value.split())
+    if len(value) <= limit:
+        return value
+
+    sentence_end = -1
+    for marker in (". ", "! ", "? ", "; "):
+        position = value.rfind(marker, 0, limit)
+        if position > sentence_end:
+            sentence_end = position + 1
+    if sentence_end >= int(limit * 0.55):
+        return value[:sentence_end].rstrip()
+
+    word_end = value.rfind(" ", 0, limit)
+    if word_end >= int(limit * 0.70):
+        return value[:word_end].rstrip() + "…"
+    return value[:limit].rstrip() + "…"
+
+
 def format_ai_analysis(
     analysis: AIMarketAnalysis,
     model: str,
     source_note: str = "phân tích mới",
 ) -> str:
-    def compact(value: str, limit: int = 240) -> str:
-        value = " ".join(value.split())
-        return value if len(value) <= limit else value[: limit - 1].rstrip() + "…"
-
     return "\n".join(
         [
             f"🤖 AI — {model} · {source_note}",
             f"• Kết luận: {analysis.stance} · đồng thuận {analysis.data_consistency}/100 (không phải xác suất).",
-            f"• Cấu trúc 3 khung: {compact(analysis.chart_structure_vi, 160)}",
-            f"• Nguyên nhân: {compact(analysis.momentum_vi + ' ' + analysis.news_context_vi, 180)}",
-            f"• Điều kiện: {compact(analysis.primary_scenario_vi, 180)}",
-            f"• Vô hiệu/rủi ro: {compact(analysis.alternative_scenario_vi + ' ' + analysis.risk_vi, 200)}",
+            f"• Cấu trúc 3 khung: {_complete_ai_text(analysis.chart_structure_vi, 700)}",
+            f"• Nguyên nhân: {_complete_ai_text(analysis.momentum_vi + ' ' + analysis.news_context_vi, 900)}",
+            f"• Điều kiện: {_complete_ai_text(analysis.primary_scenario_vi, 700)}",
+            f"• Vô hiệu/rủi ro: {_complete_ai_text(analysis.alternative_scenario_vi + ' ' + analysis.risk_vi, 900)}",
         ]
     )
 
@@ -679,10 +695,6 @@ def format_peak_ai_review(
     model: str,
     gate: PeakTradeGate,
 ) -> str:
-    def compact(value: str, limit: int) -> str:
-        value = " ".join(value.split())
-        return value if len(value) <= limit else value[: limit - 1].rstrip() + "…"
-
     resistance_text = (
         f"R {gate.resistance.lower:.2f}–{gate.resistance.upper:.2f}"
         if gate.resistance is not None
@@ -699,9 +711,9 @@ def format_peak_ai_review(
             f"🤖 AI REVIEW ĐỈNH — {model}",
             f"• Kết luận: {review.decision} · đồng thuận {review.data_consistency}/100 (không phải xác suất).",
             f"• Vùng code: {resistance_text} · {support_text}.",
-            f"• Bộ lọc code: {compact(gate.reason, 180)}",
-            f"• Review: {compact(review.review_vi, 180)}",
-            f"• Xác nhận: {compact(review.confirmation_vi, 180)}",
-            f"• Vô hiệu/rủi ro: {compact(review.invalidation_vi + ' ' + review.risk_vi, 200)}",
+            f"• Bộ lọc code: {_complete_ai_text(gate.reason, 700)}",
+            f"• Review: {_complete_ai_text(review.review_vi, 700)}",
+            f"• Xác nhận: {_complete_ai_text(review.confirmation_vi, 700)}",
+            f"• Vô hiệu/rủi ro: {_complete_ai_text(review.invalidation_vi + ' ' + review.risk_vi, 900)}",
         ]
     )
