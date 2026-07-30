@@ -254,6 +254,31 @@ class PeakOpportunity:
     sized_plan: TradingPlan | None
 
 
+@dataclass(frozen=True)
+class ProposedOrderAssessment:
+    side: str
+    margin_usdt: float
+    entry_price: float
+    leverage: int
+    requested_notional_usdt: float
+    quantity_xau: float
+    actual_notional_usdt: float
+    margin_pct: float
+    market_price: float
+    code_side: str | None
+    entry_lower: float | None
+    entry_upper: float | None
+    stop_loss: float | None
+    take_profit_1: float | None
+    take_profit_2: float | None
+    estimated_risk_usdt: float | None
+    estimated_risk_pct: float | None
+    setup_allowed: bool
+    real_order_allowed: bool
+    verdict: str
+    reasons: tuple[str, ...]
+
+
 def _wilson_percentage(wins: int, total: int) -> tuple[float, float] | None:
     """Return a 95% Wilson interval as percentages for displayed win-rate evidence."""
     if total <= 0:
@@ -403,6 +428,204 @@ def format_peak_backtest_evidence(config: dict, tier: str) -> str:
         f"Tỷ lệ thắng backtest {scope}: {wins}/{trades} = {win_rate:.1f}%"
         f"{interval_text} · {validation_text}; không dùng như cam kết cho lệnh kế tiếp."
     )
+
+
+def assess_proposed_order(
+    opportunity: PeakOpportunity,
+    side: str,
+    margin_usdt: float,
+    entry_price: float,
+    leverage: int,
+    settings: dict,
+) -> ProposedOrderAssessment:
+    """Check a user-proposed order against the deterministic live setup."""
+    if side not in {"LONG", "SHORT"}:
+        raise ValueError("Proposed order side must be LONG or SHORT")
+    if margin_usdt <= 0 or entry_price <= 0 or leverage <= 0:
+        raise ValueError("Margin, entry and leverage must be positive")
+    balance = float(
+        os.getenv(
+            "ACCOUNT_BALANCE_USDT",
+            settings.get("account_balance_usdt", 1000),
+        )
+    )
+    requested_notional = margin_usdt * leverage
+    quantity_step = max(1e-9, float(settings.get("quantity_step", 0.001)))
+    quantity = math.floor((requested_notional / entry_price) / quantity_step) * quantity_step
+    actual_notional = quantity * entry_price
+    margin_pct = margin_usdt / balance * 100 if balance > 0 else math.inf
+    plan = opportunity.execution_plan
+    quality = opportunity.quality
+    reasons: list[str] = []
+
+    minimum_quantity = max(
+        quantity_step,
+        float(settings.get("minimum_quantity", quantity_step)),
+    )
+    minimum_notional = max(0.0, float(settings.get("minimum_notional_usdt", 5.0)))
+    if balance <= 0:
+        reasons.append("số dư tài khoản cấu hình không hợp lệ")
+    if quantity < minimum_quantity or actual_notional < minimum_notional:
+        reasons.append("khối lượng/notional sau làm tròn nhỏ hơn mức tối thiểu")
+    maximum_leverage = max(1, int(settings.get("max_leverage", 5)))
+    if leverage > maximum_leverage:
+        reasons.append(
+            f"đòn bẩy {leverage}x vượt trần cấu hình {maximum_leverage}x"
+        )
+    maximum_margin_pct = max(0.0, float(settings.get("max_margin_pct", 25.0)))
+    if margin_pct > maximum_margin_pct:
+        reasons.append(
+            f"ký quỹ chiếm {margin_pct:.1f}% tài khoản, vượt trần {maximum_margin_pct:.1f}%"
+        )
+    if not quality.actionable:
+        if quality.blockers:
+            reasons.extend(quality.blockers[:3])
+        else:
+            reasons.append(f"điểm setup {quality.score}/100 chưa đạt ngưỡng")
+    if plan is None:
+        reasons.append(opportunity.execution_reason)
+    elif plan.side != side:
+        reasons.append(
+            f"code đang {plan.side}, ngược với lệnh {side} bạn đề xuất"
+        )
+    elif not plan.entry_lower <= entry_price <= plan.entry_upper:
+        reasons.append(
+            f"entry {entry_price:.2f} nằm ngoài vùng code "
+            f"{plan.entry_lower:.2f}–{plan.entry_upper:.2f}"
+        )
+
+    estimated_risk_usdt = None
+    estimated_risk_pct = None
+    if plan is not None and plan.side == side and quantity > 0:
+        stop_is_valid = (
+            plan.stop_loss < entry_price
+            if side == "LONG"
+            else plan.stop_loss > entry_price
+        )
+        if not stop_is_valid:
+            reasons.append("SL cấu trúc nằm sai phía so với entry đã nhập")
+        else:
+            fee_pct = max(
+                0.0,
+                float(settings.get("estimated_round_trip_fee_pct", 0.10)),
+            )
+            slippage_bps = max(
+                0.0,
+                float(settings.get("estimated_slippage_bps", 2.0)),
+            )
+            estimated_cost = actual_notional * (
+                fee_pct / 100 + slippage_bps / 10_000
+            )
+            estimated_risk_usdt = (
+                quantity * abs(entry_price - plan.stop_loss) + estimated_cost
+            )
+            estimated_risk_pct = (
+                estimated_risk_usdt / balance * 100 if balance > 0 else math.inf
+            )
+            if (
+                quality.actionable
+                and quality.recommended_risk_pct > 0
+                and estimated_risk_pct > quality.recommended_risk_pct + 1e-9
+            ):
+                reasons.append(
+                    f"rủi ro {estimated_risk_pct:.2f}% tài khoản vượt trần tier "
+                    f"{quality.recommended_risk_pct:.2f}%"
+                )
+
+    unique_reasons = tuple(dict.fromkeys(reason for reason in reasons if reason))
+    setup_allowed = not unique_reasons
+    real_order_allowed = setup_allowed and not quality.paper_only
+    if setup_allowed and quality.paper_only:
+        verdict = "CHỈ PAPER — setup đạt nhưng chiến lược chưa đủ mẫu để vào tiền thật"
+    elif real_order_allowed:
+        verdict = f"CÓ THỂ CANH {side} — chỉ đặt Limit đúng vùng, không đuổi giá"
+    else:
+        verdict = "KHÔNG VÀO"
+    return ProposedOrderAssessment(
+        side=side,
+        margin_usdt=margin_usdt,
+        entry_price=entry_price,
+        leverage=leverage,
+        requested_notional_usdt=requested_notional,
+        quantity_xau=quantity,
+        actual_notional_usdt=actual_notional,
+        margin_pct=margin_pct,
+        market_price=opportunity.realtime_quote.price,
+        code_side=plan.side if plan is not None else None,
+        entry_lower=plan.entry_lower if plan is not None else None,
+        entry_upper=plan.entry_upper if plan is not None else None,
+        stop_loss=plan.stop_loss if plan is not None and plan.side == side else None,
+        take_profit_1=(
+            plan.take_profit_1 if plan is not None and plan.side == side else None
+        ),
+        take_profit_2=(
+            plan.take_profit_2 if plan is not None and plan.side == side else None
+        ),
+        estimated_risk_usdt=estimated_risk_usdt,
+        estimated_risk_pct=estimated_risk_pct,
+        setup_allowed=setup_allowed,
+        real_order_allowed=real_order_allowed,
+        verdict=verdict,
+        reasons=unique_reasons,
+    )
+
+
+def format_proposed_order_assessment(
+    opportunity: PeakOpportunity,
+    assessment: ProposedOrderAssessment,
+    backtest_evidence: str,
+) -> str:
+    quality = opportunity.quality
+    factors = quality.factors
+    lines = [
+        f"🧾 ĐÁNH GIÁ LỆNH DỰ KIẾN {assessment.side}",
+        f"• Ký quỹ {assessment.margin_usdt:.2f} USDT · {assessment.leverage}x · "
+        f"notional thực {assessment.actual_notional_usdt:.2f} USDT · "
+        f"{assessment.quantity_xau:.3f} XAU.",
+        f"• Entry bạn muốn {assessment.entry_price:.2f} · giá thị trường "
+        f"{assessment.market_price:.2f}.",
+        f"📐 Score {quality.score}/100 · {quality.tier} · {quality.recommendation}.",
+        f"• MTF {factors.get('multi_timeframe_alignment', 0)}/18 · "
+        f"trigger 15m {factors.get('closed_15m_trigger', 0)}/18 · "
+        f"xác nhận 1H {factors.get('closed_1h_confirmation', 0)}/12 · "
+        f"D1 {factors.get('daily_context', 0)}/8.",
+        f"• Zone {factors.get('zone_reliability', 0)}/10 · "
+        f"volume/spread {factors.get('volume_liquidity_spread', 0)}/10 · "
+        f"R:R {factors.get('structural_reward_risk', 0)}/12 · "
+        f"sweep/FOMO {factors.get('sweep_fomo_context', 0)}/7.",
+        f"• {backtest_evidence}",
+        f"• Sweep/FOMO: {opportunity.trap.reason}.",
+        f"• Tin vĩ mô: {opportunity.macro_risk.level} · "
+        f"{opportunity.macro_risk.reason}",
+    ]
+    if assessment.entry_lower is not None and assessment.entry_upper is not None:
+        lines.append(
+            f"• Vùng Entry code: {assessment.entry_lower:.2f}–"
+            f"{assessment.entry_upper:.2f} · hướng code {assessment.code_side}."
+        )
+    if assessment.stop_loss is not None:
+        lines.append(
+            f"• SL {assessment.stop_loss:.2f} · TP1 "
+            f"{assessment.take_profit_1:.2f} · TP2 {assessment.take_profit_2:.2f}."
+        )
+    if assessment.estimated_risk_usdt is not None:
+        lines.append(
+            f"• Rủi ro đến SL sau phí/trượt ước tính "
+            f"{assessment.estimated_risk_usdt:.2f} USDT "
+            f"({assessment.estimated_risk_pct:.2f}% tài khoản); trần tier "
+            f"{quality.recommended_risk_pct:.2f}%."
+        )
+    lines += [
+        f"🧭 KẾT LUẬN CODE: {assessment.verdict}",
+        *(
+            ["• Lý do: " + " | ".join(assessment.reasons[:5])]
+            if assessment.reasons
+            else ["• Đủ điều kiện định lượng hiện tại; vẫn phải chờ Limit khớp và đặt SL ngay."]
+        ),
+        "• Lệnh này chỉ được đánh giá; bot KHÔNG đặt lệnh và KHÔNG bắt đầu monitor. "
+        "Chỉ dùng /long hoặc /short sau khi lệnh thật đã khớp.",
+    ]
+    return "\n".join(lines)
 
 
 def interval_to_minutes(interval: str) -> int:
@@ -834,6 +1057,162 @@ def compute_peak_opportunity(
         quality=quality,
         sized_plan=sized_plan,
     )
+
+
+def build_opportunity_ai_snapshot(
+    opportunity: PeakOpportunity,
+    execution_plan: PeakExecutionPlan | None,
+    execution_reason: str,
+) -> dict:
+    return build_peak_ai_snapshot(
+        peak_map=opportunity.peak_map,
+        gate=opportunity.gate,
+        frames=opportunity.frames,
+        momentum_scores=opportunity.momentum_scores,
+        derivatives_metrics={
+            "last_or_mid_price": opportunity.realtime_quote.price,
+            "mark_price": opportunity.realtime_quote.mark_price,
+            "index_price": opportunity.realtime_quote.index_price,
+            "bid": opportunity.realtime_quote.bid_price,
+            "ask": opportunity.realtime_quote.ask_price,
+            "funding_rate": opportunity.realtime_quote.funding_rate,
+            "open_interest": opportunity.realtime_quote.open_interest,
+        },
+        execution_plan=execution_plan,
+        execution_reason=execution_reason,
+        liquidity=opportunity.liquidity,
+        hourly_structure=opportunity.hourly_structure,
+        daily_structure=opportunity.daily_structure,
+        setup_quality=opportunity.quality,
+        liquidity_trap=opportunity.trap,
+        macro_risk=opportunity.macro_risk,
+    )
+
+
+async def request_peak_ai_review(
+    context: ContextTypes.DEFAULT_TYPE,
+    opportunity: PeakOpportunity,
+    snapshot: dict,
+) -> str:
+    """Request a fresh constrained AI review and return a user-facing message."""
+    ai_config = context.bot_data["config"].get("ai_analysis", {})
+    if not ai_config.get("enabled", True) or not ai_config.get(
+        "peak_review_enabled",
+        True,
+    ):
+        return "🤖 AI review đang tắt trong config; kết luận code phía trên vẫn có hiệu lực."
+
+    candidates = []
+    groq_key = os.getenv("GROQ_API_KEY")
+    groq_config = ai_config.get("groq", {})
+    if groq_key:
+        groq_model = groq_config.get("model", "qwen/qwen3.6-27b")
+        candidates.append(
+            {
+                "provider": "Groq",
+                "model": groq_model,
+                "label": f"Groq · {groq_model}",
+                "api_key": groq_key,
+                "analyzer": analyze_peak_with_groq,
+                "usage_path": groq_config.get(
+                    "usage_path",
+                    "logs/groq_usage.json",
+                ),
+                "daily_budget": int(groq_config.get("daily_call_budget", 900)),
+                "cooldown_minutes": int(
+                    groq_config.get("rate_limit_cooldown_minutes", 2)
+                ),
+            }
+        )
+    gemini_key = os.getenv("GEMINI_API_KEY")
+    gemini_config = ai_config.get("gemini", {})
+    if gemini_key:
+        gemini_models = [
+            gemini_config.get("model", "gemini-3.6-flash"),
+            gemini_config.get("fallback_model", "gemini-3.5-flash-lite"),
+        ]
+        for gemini_model in dict.fromkeys(filter(None, gemini_models)):
+            candidates.append(
+                {
+                    "provider": "Gemini",
+                    "model": gemini_model,
+                    "label": f"Gemini · {gemini_model}",
+                    "api_key": gemini_key,
+                    "analyzer": analyze_peak_with_gemini,
+                    "usage_path": gemini_config.get(
+                        "usage_path",
+                        "logs/gemini_usage.json",
+                    ),
+                    "daily_budget": int(
+                        gemini_config.get("daily_call_budget", 15)
+                    ),
+                    "cooldown_minutes": int(
+                        gemini_config.get("rate_limit_cooldown_minutes", 60)
+                    ),
+                }
+            )
+    if not candidates:
+        return (
+            "🤖 AI chưa được cấu hình. Thêm GROQ_API_KEY hoặc GEMINI_API_KEY; "
+            "kết luận code phía trên vẫn dùng dữ liệu live."
+        )
+
+    timeout_seconds = int(ai_config.get("timeout_seconds", 35))
+    unavailable_reasons = []
+    last_error = None
+    for candidate in candidates:
+        blocker_key = (
+            f"ai_blocked_until:{candidate['provider']}:{candidate['model']}"
+        )
+        blocked_until = context.bot_data.get(blocker_key)
+        if blocked_until is not None and datetime.now(timezone.utc) < blocked_until:
+            unavailable_reasons.append(f"{candidate['label']} đang chờ rate limit")
+            continue
+        if not ai_daily_budget_available(
+            candidate["usage_path"],
+            candidate["daily_budget"],
+        ):
+            unavailable_reasons.append(f"{candidate['label']} đã hết ngân sách ngày")
+            continue
+        record_ai_call(candidate["usage_path"])
+        try:
+            review = await asyncio.wait_for(
+                asyncio.to_thread(
+                    candidate["analyzer"],
+                    candidate["api_key"],
+                    candidate["model"],
+                    timeout_seconds,
+                    snapshot,
+                ),
+                timeout=timeout_seconds + 5,
+            )
+            return format_peak_ai_review(
+                review,
+                candidate["label"],
+                opportunity.gate,
+            )
+        except Exception as exc:
+            last_error = exc
+            if is_ai_rate_limit_error(exc):
+                context.bot_data[blocker_key] = (
+                    datetime.now(timezone.utc)
+                    + timedelta(minutes=candidate["cooldown_minutes"])
+                )
+                logger.warning(
+                    "Peak AI %s rate-limited; trying fallback",
+                    candidate["label"],
+                )
+            else:
+                logger.warning(
+                    "Peak AI %s failed: %s",
+                    candidate["label"],
+                    type(exc).__name__,
+                )
+    if last_error is not None and is_ai_rate_limit_error(last_error):
+        return "🤖 AI đang bị rate limit; bot không dùng kết quả cũ."
+    if unavailable_reasons:
+        return "🤖 AI review: " + "; ".join(unavailable_reasons) + "."
+    return "🤖 AI review tạm lỗi; kết luận code phía trên vẫn là dữ liệu mới."
 
 
 def format_reply(bias: MomentumBias, result: SignalResult, interval: str, plan_settings: dict) -> str:
@@ -1865,6 +2244,38 @@ def _parse_utc(value) -> datetime | None:
         return parsed.astimezone(timezone.utc)
     except (TypeError, ValueError):
         return None
+
+
+PROPOSED_ORDER_TEXT_PATTERN = re.compile(
+    r"^/?vo_(?P<side>long|short|sort)(?:@\w+)?:\s*"
+    r"(?P<margin>\d+(?:[.,]\d+)?)\s*:\s*"
+    r"(?P<entry>\d+(?:[.,]\d+)?)\s*:\s*"
+    r"(?P<leverage>\d+)\s*x?\s*$",
+    re.IGNORECASE,
+)
+PROPOSED_ORDER_COMMAND_PATTERN = re.compile(
+    r"^/vo_(?P<side>long|short|sort)(?:@\w+)?\s+"
+    r"(?P<margin>\d+(?:[.,]\d+)?)\s*[_\s-]+\s*"
+    r"(?P<entry>\d+(?:[.,]\d+)?)\s*[_\s-]+\s*"
+    r"(?P<leverage>\d+)\s*x?\s*$",
+    re.IGNORECASE,
+)
+
+
+def parse_proposed_order_command(text: str) -> tuple[str, float, float, int] | None:
+    value = (text or "").strip()
+    match = PROPOSED_ORDER_TEXT_PATTERN.fullmatch(value)
+    if match is None:
+        match = PROPOSED_ORDER_COMMAND_PATTERN.fullmatch(value)
+    if match is None:
+        return None
+    side = "LONG" if match.group("side").lower() == "long" else "SHORT"
+    return (
+        side,
+        float(match.group("margin").replace(",", ".")),
+        float(match.group("entry").replace(",", ".")),
+        int(match.group("leverage")),
+    )
 
 
 MANUAL_POSITION_TEXT_PATTERN = re.compile(
@@ -3579,6 +3990,164 @@ async def handle_auto_off(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await update.message.reply_text("⏸ Đã tắt canh tự động. /gia và /dinh vẫn dùng bình thường.")
 
 
+def command_help_text(config: dict) -> str:
+    manual_settings = _manual_position_settings(config)
+    return "\n".join(
+        [
+            "📚 HƯỚNG DẪN LỆNH XAU-SIGNAL",
+            "",
+            "PHÂN TÍCH THỊ TRƯỜNG",
+            "• /gia hoặc /signal — phân tích nhanh giá, đa khung, vùng Entry và scorecard.",
+            "• /dinh — bản đồ đỉnh/cản, xác nhận 15m–1H–D1, SL/TP và AI review.",
+            "",
+            "ĐÁNH GIÁ LỆNH CHƯA VÀO",
+            "• /vo_long:100:3350:5x — dự định LONG: ký quỹ 100 USDT, Entry 3350, đòn bẩy 5x.",
+            "• /vo_short:100:3350:5x — dự định SHORT với cùng thứ tự tham số.",
+            "• Bot chấm score/rủi ro, đối chiếu vùng code rồi gọi AI; KHÔNG đặt lệnh và KHÔNG bật monitor.",
+            "",
+            "THEO DÕI LỆNH ĐÃ KHỚP",
+            "• /long:100:3350:5x — khai báo LONG đã khớp để theo dõi.",
+            "• /short:100:3350:5x — khai báo SHORT đã khớp; /sort cũng được chấp nhận.",
+            f"• Bot kiểm tra mỗi {int(manual_settings.get('poll_seconds', 10))} giây và nhắc đến khi gửi /dong.",
+            "• /vithe — xem PnL, ROE, SL/TP và trạng thái vị thế đang theo dõi.",
+            "• /dong — dừng monitor; KHÔNG đóng lệnh thật trên Binance.",
+            "",
+            "CANH TỰ ĐỘNG",
+            "• /canh — xem bot đang bật/tắt, lần quét, gate và lỗi gần nhất.",
+            "• /canhbat — bật canh tự động.",
+            "• /canhtat — tắt canh tự động.",
+            "",
+            "TRỢ GIÚP",
+            "• /h hoặc /help — hiện lại danh sách này.",
+            "",
+            "Thứ tự lệnh có số luôn là: ký quỹ USDT : giá Entry : đòn bẩy.",
+        ]
+    )
+
+
+async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.effective_message.reply_text(
+        command_help_text(context.bot_data["config"])
+    )
+
+
+async def handle_proposed_order(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    usage = (
+        "Cú pháp: /vo_long:100:3350:5x hoặc /vo_short:100:3350:5x; "
+        "thứ tự là ký quỹ USDT : giá Entry : đòn bẩy."
+    )
+    text = update.effective_message.text if update.effective_message else ""
+    parsed = parse_proposed_order_command(text)
+    if parsed is None:
+        await update.effective_message.reply_text(usage)
+        return
+    side, margin_usdt, entry_price, leverage = parsed
+    config = context.bot_data["config"]
+    manual_settings = _manual_position_settings(config)
+    minimum_margin = max(
+        0.01,
+        float(manual_settings.get("minimum_margin_usdt", 1.0)),
+    )
+    maximum_margin = max(
+        minimum_margin,
+        float(manual_settings.get("maximum_margin_usdt", 1_000_000)),
+    )
+    input_leverage_limit = max(
+        1,
+        int(manual_settings.get("maximum_leverage", 125)),
+    )
+    if not minimum_margin <= margin_usdt <= maximum_margin:
+        await update.effective_message.reply_text(
+            f"Ký quỹ phải từ {minimum_margin:.2f} đến {maximum_margin:.2f} USDT. {usage}"
+        )
+        return
+    if entry_price <= 0:
+        await update.effective_message.reply_text(f"Entry phải lớn hơn 0. {usage}")
+        return
+    if leverage < 1 or leverage > input_leverage_limit:
+        await update.effective_message.reply_text(
+            f"Đòn bẩy phải từ 1x đến {input_leverage_limit}x. {usage}"
+        )
+        return
+
+    lock = context.bot_data.setdefault("proposed_order_lock", asyncio.Lock())
+    async with lock:
+        try:
+            opportunity = await asyncio.to_thread(
+                compute_peak_opportunity,
+                config,
+                context.bot_data["provider"],
+                context.bot_data["price_stream"],
+            )
+            assessment = assess_proposed_order(
+                opportunity,
+                side,
+                margin_usdt,
+                entry_price,
+                leverage,
+                config.get("trading_plan", {}),
+            )
+            backtest_evidence = format_peak_backtest_evidence(
+                config,
+                opportunity.quality.tier,
+            )
+            await update.effective_message.reply_text(
+                format_proposed_order_assessment(
+                    opportunity,
+                    assessment,
+                    backtest_evidence,
+                )
+            )
+
+            execution_plan = (
+                opportunity.execution_plan
+                if assessment.setup_allowed
+                else None
+            )
+            execution_reason = (
+                opportunity.execution_reason
+                if assessment.setup_allowed
+                else "Lệnh người dùng không đạt: " + " | ".join(assessment.reasons)
+            )
+            snapshot = build_opportunity_ai_snapshot(
+                opportunity,
+                execution_plan,
+                execution_reason,
+            )
+            snapshot["user_proposed_order"] = {
+                "side": assessment.side,
+                "margin_usdt": assessment.margin_usdt,
+                "entry_price": assessment.entry_price,
+                "leverage": assessment.leverage,
+                "actual_notional_usdt": round(
+                    assessment.actual_notional_usdt,
+                    4,
+                ),
+                "quantity_xau": assessment.quantity_xau,
+            }
+            snapshot["user_order_evaluation"] = {
+                "setup_allowed": assessment.setup_allowed,
+                "real_order_allowed": assessment.real_order_allowed,
+                "verdict": assessment.verdict,
+                "reasons": list(assessment.reasons),
+                "estimated_risk_usdt": assessment.estimated_risk_usdt,
+                "estimated_risk_pct": assessment.estimated_risk_pct,
+            }
+        except Exception as exc:
+            logger.exception("Failed to assess proposed order")
+            await update.effective_message.reply_text(
+                f"Không đánh giá được lệnh dự kiến ({type(exc).__name__}); thử lại sau."
+            )
+            return
+
+    await update.effective_message.reply_text(
+        await request_peak_ai_review(context, opportunity, snapshot)
+    )
+
+
 async def handle_manual_position(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -3765,14 +4334,7 @@ async def handle_manual_position_close(
 
 
 async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        "Bot phân tích Binance Futures XAUUSDT.\n"
-        "• /gia hoặc /signal: kịch bản giao dịch đã xác nhận.\n"
-        "• /dinh: bản đồ đỉnh cũ/mới, cản trên và hỗ trợ retest.\n"
-        "• /long:100:3350:5x hoặc /short:100:3350:5x: ký quỹ 100 USDT, entry 3350, đòn bẩy 5x; theo dõi mỗi 10 giây.\n"
-        "• /vithe: xem PnL; /dong: dừng theo dõi thủ công.\n"
-        "• /canh: trạng thái canh tự động; /canhbat hoặc /canhtat để điều khiển."
-    )
+    await update.message.reply_text(command_help_text(context.bot_data["config"]))
 
 
 def main() -> None:
@@ -3804,11 +4366,19 @@ def main() -> None:
 
     chat_filter = filters.Chat(chat_id=authorized_chat_id)
     app.add_handler(CommandHandler("start", handle_start, filters=chat_filter))
+    app.add_handler(CommandHandler(["h", "help"], handle_help, filters=chat_filter))
     app.add_handler(CommandHandler(["signal", "gia"], handle_signal, filters=chat_filter))
     app.add_handler(CommandHandler("dinh", handle_peaks, filters=chat_filter))
     app.add_handler(CommandHandler("canh", handle_auto_status, filters=chat_filter))
     app.add_handler(CommandHandler("canhbat", handle_auto_on, filters=chat_filter))
     app.add_handler(CommandHandler("canhtat", handle_auto_off, filters=chat_filter))
+    app.add_handler(
+        CommandHandler(
+            ["vo_long", "vo_short", "vo_sort"],
+            handle_proposed_order,
+            filters=chat_filter,
+        )
+    )
     app.add_handler(
         CommandHandler(
             ["long", "short", "sort"],
@@ -3818,6 +4388,12 @@ def main() -> None:
     )
     app.add_handler(CommandHandler("vithe", handle_manual_position_status, filters=chat_filter))
     app.add_handler(CommandHandler("dong", handle_manual_position_close, filters=chat_filter))
+    app.add_handler(
+        MessageHandler(
+            chat_filter & filters.Regex(PROPOSED_ORDER_TEXT_PATTERN),
+            handle_proposed_order,
+        )
+    )
     app.add_handler(
         MessageHandler(
             chat_filter & filters.Regex(MANUAL_POSITION_TEXT_PATTERN),

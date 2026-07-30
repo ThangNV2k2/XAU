@@ -642,6 +642,7 @@ Quy tắc bắt buộc:
 8. setup_quality_score.score_out_of_100 là độ hoàn thiện điều kiện, tuyệt đối không diễn giải thành phần trăm thắng.
 9. Nếu setup_quality_score.actionable=false, macro_event_guard.blocked=true, double_sweep=true hoặc fomo_extension=true thì decision bắt buộc CHỜ.
 10. Nếu setup_quality_score.paper_only=true, mọi nhận xét CANH chỉ là paper trade; phải nói rõ không đặt lệnh thật.
+11. Nếu có user_proposed_order, phải review đúng side/Entry/đòn bẩy người dùng khai báo. Nếu user_order_evaluation.setup_allowed=false thì decision bắt buộc CHỜ và nêu lý do từ user_order_evaluation.reasons; không thay người dùng bằng một lệnh khác.
 """
 
 
@@ -654,6 +655,7 @@ def enforce_peak_review_consistency(
     quality = snapshot.get("setup_quality_score") or {}
     macro = snapshot.get("macro_event_guard") or {}
     trap = snapshot.get("liquidity_sweep_fomo_guard") or {}
+    proposed_order_evaluation = snapshot.get("user_order_evaluation") or {}
     if (
         allowed == "CHỜ"
         or snapshot.get("code_execution_plan") is None
@@ -662,6 +664,7 @@ def enforce_peak_review_consistency(
         or macro.get("blocked") is True
         or trap.get("double_sweep") is True
         or trap.get("fomo_extension") is True
+        or proposed_order_evaluation.get("setup_allowed") is False
     ):
         review.decision = "CHỜ"
     elif allowed == "CANH LONG" and review.decision == "CANH SHORT":

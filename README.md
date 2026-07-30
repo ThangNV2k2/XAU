@@ -94,13 +94,21 @@ Một tiến trình `telegram_query_bot.py` vừa trả lời lệnh, vừa tự
 
    Chỉ chat có `chat_id` khớp trong `.env` mới được bot trả lời (người khác nhắn bot sẽ bị bỏ qua, tránh lộ và tốn quota API).
 
-8. Theo dõi một vị thế đã tự mở trên Binance:
+8. Đánh giá một lệnh đang dự định vào:
+   - `/vo_long:100:3350:5x` — đề xuất LONG với 100 USDT ký quỹ, Entry 3350 và đòn bẩy 5x.
+   - `/vo_short:100:3350:5x` — đề xuất SHORT theo cùng thứ tự; alias `/vo_sort` cũng được chấp nhận.
+   - Bot đối chiếu side/Entry với gate và vùng Entry code, tính notional/khối lượng/rủi ro đến SL, kiểm tra trần đòn bẩy/risk theo tier, rồi gọi AI phản biện đúng lệnh đã nhập.
+   - `/vo_long` và `/vo_short` chỉ đánh giá; không đặt lệnh, không lưu vị thế và không bật monitor. Sau khi lệnh thật khớp mới dùng `/long` hoặc `/short`.
+
+9. Theo dõi một vị thế đã tự mở trên Binance:
    - `/long:100:3350:5x` hoặc `/long 100 3350 5x` — ghi nhận LONG với 100 USDT ký quỹ, giá entry 3350 và đòn bẩy 5x.
    - `/short:100:3350:5x` — ghi nhận SHORT; bot cũng chấp nhận alias gõ nhầm `/sort:100:3350:5x` hoặc `sort:100:3350:5x`.
    - Bot dùng đúng giá Entry bạn khai báo, đồng thời lấy bid/ask hiện tại để theo dõi; notional = ký quỹ × đòn bẩy, sau đó tính khối lượng XAU, PnL/ROE ước tính sau phí/trượt giá và SL/TP theo ATR 15m.
    - Giá được kiểm tra mỗi 10 giây. Cập nhật thường gửi theo chu kỳ; khi SL, TP2 hoặc hòa vốn sau TP1 kích hoạt, cảnh báo đóng lệnh lặp mỗi 30 giây cho đến `/dong`, kể cả khi giá sau đó hồi lại.
    - `/vithe` — xem trạng thái/PnL ngay. `/dong` — dừng monitor và xóa trạng thái đã lưu.
    - Bot không đọc tài khoản và không biết lệnh thật đã fill/đóng. `/dong` **không đóng lệnh Binance**; người dùng phải tự xác nhận vị thế, SL/TP và lệnh chờ trên sàn.
+
+10. `/h` hoặc `/help` — bot tự liệt kê toàn bộ cú pháp, giải thích `/canh`, `/vo_long`, `/long`, `/vithe`, `/dong` và các alias hiện hành.
 
 **Quan trọng:** hỗ trợ/kháng cự và retest chỉ làm giảm việc đuổi giá, không biến tín hiệu thành dự đoán chắc chắn. Dữ liệu đúng sàn loại bỏ sai lệch nguồn nhưng không tạo ra edge; không dùng riêng bot hoặc AI làm căn cứ vào lệnh đòn bẩy.
 

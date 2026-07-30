@@ -6,6 +6,7 @@ from telegram_query_bot import (
     manual_alert_is_due,
     manual_position_metrics,
     parse_manual_position_command,
+    parse_proposed_order_command,
     update_manual_position_event,
 )
 
@@ -42,6 +43,21 @@ class ManualPositionMonitorTests(unittest.TestCase):
         )
         self.assertIsNone(parse_manual_position_command("/long:100_5x"))
         self.assertIsNone(parse_manual_position_command("/long:abc:3350:5x"))
+
+    def test_proposed_order_parser_is_distinct_from_filled_position(self):
+        self.assertEqual(
+            parse_proposed_order_command("/vo_long:100:3350:5x"),
+            ("LONG", 100.0, 3350.0, 5),
+        )
+        self.assertEqual(
+            parse_proposed_order_command("/vo_short 50 3360 3x"),
+            ("SHORT", 50.0, 3360.0, 3),
+        )
+        self.assertEqual(
+            parse_proposed_order_command("vo_sort:25,5:3375,2:2x"),
+            ("SHORT", 25.5, 3375.2, 2),
+        )
+        self.assertIsNone(parse_proposed_order_command("/long:100:3350:5x"))
 
     def test_long_position_uses_margin_times_leverage_and_atr_levels(self):
         position = build_manual_position_state(

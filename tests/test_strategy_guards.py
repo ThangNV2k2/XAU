@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 import pandas as pd
 
+from ai_analysis import AIPeakReview, enforce_peak_review_consistency
 from backtest.peak_backtester import _wilson_interval
 from indicators.signal_engine import compute_momentum_bias, compute_momentum_bias_series
 from macro_risk import MacroRiskAssessment, assess_macro_risk, parse_fomc_calendar
@@ -21,7 +22,7 @@ from peak_analysis import (
     assess_peak_trade_gate,
     assess_setup_quality,
 )
-from telegram_query_bot import format_peak_backtest_evidence
+from telegram_query_bot import assess_proposed_order, format_peak_backtest_evidence
 
 
 def zone(lower: float, upper: float, status: str) -> PeakZone:
@@ -242,6 +243,93 @@ class StrategyGuardTests(unittest.TestCase):
         self.assertIn("CI95%", text)
         self.assertIn("CHƯA ĐỦ MẪU 3/100", text)
         self.assertIn("không dùng như cam kết", text)
+
+    def test_proposed_order_checks_entry_side_risk_and_paper_mode(self):
+        quality = SimpleNamespace(
+            actionable=True,
+            blockers=(),
+            score=96,
+            tier="S · 90+",
+            recommendation="PAPER · SETUP RẤT CHỌN LỌC",
+            recommended_risk_pct=0.5,
+            paper_only=True,
+        )
+        plan = PeakExecutionPlan(
+            "LONG",
+            3349.0,
+            3351.0,
+            3350.0,
+            3345.0,
+            3355.0,
+            3360.0,
+            1.0,
+            2.0,
+            "resistance",
+        )
+        opportunity = SimpleNamespace(
+            execution_plan=plan,
+            execution_reason="confirmed",
+            quality=quality,
+            realtime_quote=SimpleNamespace(price=3352.0),
+        )
+        settings = {
+            "account_balance_usdt": 1000,
+            "quantity_step": 0.001,
+            "minimum_quantity": 0.001,
+            "minimum_notional_usdt": 5,
+            "max_leverage": 5,
+            "max_margin_pct": 25,
+            "estimated_round_trip_fee_pct": 0.1,
+            "estimated_slippage_bps": 2,
+        }
+        assessment = assess_proposed_order(
+            opportunity,
+            "LONG",
+            100.0,
+            3350.0,
+            5,
+            settings,
+        )
+        self.assertTrue(assessment.setup_allowed)
+        self.assertFalse(assessment.real_order_allowed)
+        self.assertIn("CHỈ PAPER", assessment.verdict)
+        self.assertAlmostEqual(assessment.actual_notional_usdt, 499.15)
+        self.assertLess(assessment.estimated_risk_pct, 0.5)
+
+        wrong_side = assess_proposed_order(
+            opportunity,
+            "SHORT",
+            100.0,
+            3350.0,
+            5,
+            settings,
+        )
+        self.assertFalse(wrong_side.setup_allowed)
+        self.assertTrue(any("ngược với lệnh SHORT" in reason for reason in wrong_side.reasons))
+
+    def test_ai_cannot_approve_a_rejected_user_order(self):
+        review = AIPeakReview(
+            decision="CANH LONG",
+            review_vi="bullish",
+            confirmation_vi="confirmed",
+            invalidation_vi="below stop",
+            risk_vi="risk",
+            data_consistency=90,
+        )
+        snapshot = {
+            "deterministic_gate": {"allowed_decision": "CANH LONG"},
+            "code_execution_plan": {"side": "LONG"},
+            "liquidity_guard": {"entries_allowed": True},
+            "setup_quality_score": {"actionable": True, "paper_only": False},
+            "macro_event_guard": {"blocked": False},
+            "liquidity_sweep_fomo_guard": {
+                "double_sweep": False,
+                "fomo_extension": False,
+            },
+            "user_order_evaluation": {"setup_allowed": False},
+        }
+        enforced = enforce_peak_review_consistency(review, snapshot)
+        self.assertEqual(enforced.decision, "CHỜ")
 
 
 if __name__ == "__main__":
