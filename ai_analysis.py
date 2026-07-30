@@ -457,6 +457,9 @@ def build_peak_ai_snapshot(
     liquidity: PeakLiquidityAssessment | None = None,
     hourly_structure: ChartStructure | None = None,
     daily_structure: ChartStructure | None = None,
+    setup_quality=None,
+    liquidity_trap=None,
+    macro_risk=None,
 ) -> dict:
     def zone_payload(zone) -> dict | None:
         if zone is None:
@@ -553,6 +556,52 @@ def build_peak_ai_snapshot(
             if liquidity is not None
             else None
         ),
+        "setup_quality_score": (
+            {
+                "score_out_of_100": setup_quality.score,
+                "tier": setup_quality.tier,
+                "recommendation": setup_quality.recommendation,
+                "recommended_risk_pct": setup_quality.recommended_risk_pct,
+                "actionable": setup_quality.actionable,
+                "paper_only": setup_quality.paper_only,
+                "factors": setup_quality.factors,
+                "blockers": list(setup_quality.blockers),
+                "important": "Quality score is not a win probability.",
+            }
+            if setup_quality is not None
+            else None
+        ),
+        "liquidity_sweep_fomo_guard": (
+            {
+                "buy_side_sweep": liquidity_trap.buy_side_sweep,
+                "sell_side_sweep": liquidity_trap.sell_side_sweep,
+                "double_sweep": liquidity_trap.double_sweep,
+                "fomo_extension": liquidity_trap.fomo_extension,
+                "volume_ratio": liquidity_trap.volume_ratio,
+                "latest_range_atr": liquidity_trap.latest_range_atr,
+                "ema_extension_atr": liquidity_trap.ema_extension_atr,
+                "reason": liquidity_trap.reason,
+            }
+            if liquidity_trap is not None
+            else None
+        ),
+        "macro_event_guard": (
+            {
+                "blocked": macro_risk.blocked,
+                "level": macro_risk.level,
+                "reason": macro_risk.reason,
+                "event_name": macro_risk.event_name,
+                "event_time": (
+                    macro_risk.event_time.isoformat()
+                    if macro_risk.event_time is not None
+                    else None
+                ),
+                "minutes_to_event": macro_risk.minutes_to_event,
+                "source": macro_risk.source,
+            }
+            if macro_risk is not None
+            else None
+        ),
         "code_execution_plan": (
             {
                 "side": execution_plan.side,
@@ -590,6 +639,9 @@ Quy tắc bắt buộc:
 5. Funding, OI, basis, volume và order book không được dùng riêng lẻ để chọn hướng.
 6. Mỗi trường văn bản tối đa 180 ký tự; data_consistency không phải xác suất thắng.
 7. Phải ưu tiên cấu trúc 15m/1H/D1: 15m tìm Entry, 1H xác nhận, D1 không được đối nghịch mạnh. Nếu liquidity_guard.entries_allowed=false thì decision bắt buộc CHỜ.
+8. setup_quality_score.score_out_of_100 là độ hoàn thiện điều kiện, tuyệt đối không diễn giải thành phần trăm thắng.
+9. Nếu setup_quality_score.actionable=false, macro_event_guard.blocked=true, double_sweep=true hoặc fomo_extension=true thì decision bắt buộc CHỜ.
+10. Nếu setup_quality_score.paper_only=true, mọi nhận xét CANH chỉ là paper trade; phải nói rõ không đặt lệnh thật.
 """
 
 
@@ -599,16 +651,27 @@ def enforce_peak_review_consistency(
 ) -> AIPeakReview:
     allowed = snapshot["deterministic_gate"]["allowed_decision"]
     liquidity = snapshot.get("liquidity_guard") or {}
+    quality = snapshot.get("setup_quality_score") or {}
+    macro = snapshot.get("macro_event_guard") or {}
+    trap = snapshot.get("liquidity_sweep_fomo_guard") or {}
     if (
         allowed == "CHỜ"
         or snapshot.get("code_execution_plan") is None
         or liquidity.get("entries_allowed") is False
+        or quality.get("actionable") is False
+        or macro.get("blocked") is True
+        or trap.get("double_sweep") is True
+        or trap.get("fomo_extension") is True
     ):
         review.decision = "CHỜ"
     elif allowed == "CANH LONG" and review.decision == "CANH SHORT":
         review.decision = "CHỜ"
     elif allowed == "CANH SHORT" and review.decision == "CANH LONG":
         review.decision = "CHỜ"
+    if quality.get("paper_only") is True:
+        paper_notice = "PAPER ONLY — không đặt lệnh thật."
+        if paper_notice not in review.risk_vi:
+            review.risk_vi = f"{paper_notice} {review.risk_vi}".strip()
     return review
 
 

@@ -98,6 +98,7 @@ class PeakTradeGate:
     hourly_confirmed: bool = False
     liquidity_confirmed: bool = True
     daily_confirmed: bool = False
+    near_resistance_confirmed: bool = False
 
 
 @dataclass
@@ -124,6 +125,30 @@ class PeakLiquidityAssessment:
     spread_bps: float | None
     entries_allowed: bool
     reason: str
+
+
+@dataclass(frozen=True)
+class LiquidityTrapAssessment:
+    buy_side_sweep: bool
+    sell_side_sweep: bool
+    double_sweep: bool
+    fomo_extension: bool
+    volume_ratio: float | None
+    latest_range_atr: float
+    ema_extension_atr: float
+    reason: str
+
+
+@dataclass(frozen=True)
+class SetupQualityAssessment:
+    score: int
+    tier: str
+    recommendation: str
+    recommended_risk_pct: float
+    actionable: bool
+    paper_only: bool
+    factors: dict[str, int]
+    blockers: tuple[str, ...]
 
 
 def find_confirmed_fractals(
@@ -200,15 +225,18 @@ def filter_zigzag_pivots(
 
 
 def _atr_series(df: pd.DataFrame) -> pd.Series:
+    fallback = (df["high"] - df["low"]).rolling(14, min_periods=1).mean()
     if len(df) < 15:
-        fallback = (df["high"] - df["low"]).rolling(5, min_periods=1).mean()
         return fallback.clip(lower=1e-9)
-    return AverageTrueRange(
+    atr = AverageTrueRange(
         pd.to_numeric(df["high"], errors="coerce"),
         pd.to_numeric(df["low"], errors="coerce"),
         pd.to_numeric(df["close"], errors="coerce"),
         window=14,
-    ).average_true_range().replace(0, pd.NA).ffill().bfill().fillna(1e-9)
+    ).average_true_range()
+    # Use only same/past bars for warmup. Back-filling here would leak later
+    # volatility into early historical pivots during point-in-time replay.
+    return atr.mask(atr <= 0).fillna(fallback).clip(lower=1e-9)
 
 
 def _volume_ratio_at(df: pd.DataFrame, position: int) -> float | None:
@@ -226,6 +254,7 @@ def _volume_ratio_at(df: pd.DataFrame, position: int) -> float | None:
 def _build_peak_evidence(
     frames: dict[str, pd.DataFrame],
     settings: dict,
+    cache: dict | None = None,
 ) -> tuple[list[PeakEvidence], bool]:
     span = max(1, int(settings.get("fractal_span", 2)))
     reversal_settings = settings.get("zigzag_reversal_pct", {})
@@ -234,6 +263,21 @@ def _build_peak_evidence(
     volume_available = False
 
     for timeframe, df in frames.items():
+        cache_key = (
+            timeframe,
+            df.index[0] if not df.empty else None,
+            df.index[-1] if not df.empty else None,
+            len(df),
+            span,
+            float(reversal_settings.get(timeframe, 0.25)),
+            reaction_bars,
+        )
+        cached = cache.get(timeframe) if cache is not None else None
+        if cached is not None and cached[0] == cache_key:
+            evidence.extend(cached[1])
+            volume_available = volume_available or cached[2]
+            continue
+
         fractals = find_confirmed_fractals(df, timeframe, span)
         reversal_pct = float(reversal_settings.get(timeframe, 0.25))
         zigzag = filter_zigzag_pivots(fractals, reversal_pct)
@@ -244,7 +288,9 @@ def _build_peak_evidence(
             if pivot.direction == "high"
         }
         atr = _atr_series(df)
-        volume_available = volume_available or "volume" in df.columns
+        timeframe_has_volume = "volume" in df.columns
+        volume_available = volume_available or timeframe_has_volume
+        timeframe_evidence: list[PeakEvidence] = []
 
         for pivot in fractals:
             if pivot.direction != "high":
@@ -258,7 +304,7 @@ def _build_peak_evidence(
                 else 0.0
             )
             pivot_atr = max(float(atr.iloc[pivot.bar_position]), 1e-9)
-            evidence.append(
+            timeframe_evidence.append(
                 PeakEvidence(
                     timeframe=timeframe,
                     timestamp=pivot.timestamp,
@@ -269,6 +315,13 @@ def _build_peak_evidence(
                     volume_ratio=_volume_ratio_at(df, pivot.bar_position),
                 )
             )
+        evidence.extend(timeframe_evidence)
+        if cache is not None:
+            cache[timeframe] = (
+                cache_key,
+                timeframe_evidence,
+                timeframe_has_volume,
+            )
     return evidence, volume_available
 
 
@@ -276,20 +329,23 @@ def _cluster_evidence(
     evidence: list[PeakEvidence],
     tolerance: float,
 ) -> list[list[PeakEvidence]]:
+    """Single-link adjacent price clustering over sorted evidence.
+
+    The previous implementation rescanned every existing cluster for every point
+    (quadratic on dense histories). Sorted prices guarantee the nearest eligible
+    cluster is the last one, making this linear after sorting.
+    """
     clusters: list[list[PeakEvidence]] = []
     for item in sorted(evidence, key=lambda value: value.price):
-        best_cluster = None
-        best_distance = float("inf")
-        for cluster in clusters:
-            center = sum(point.price for point in cluster) / len(cluster)
-            distance = abs(item.price - center)
-            if distance <= tolerance and distance < best_distance:
-                best_cluster = cluster
-                best_distance = distance
-        if best_cluster is None:
+        if not clusters:
             clusters.append([item])
+            continue
+        latest_cluster = clusters[-1]
+        center = sum(point.price for point in latest_cluster) / len(latest_cluster)
+        if abs(item.price - center) <= tolerance:
+            latest_cluster.append(item)
         else:
-            best_cluster.append(item)
+            clusters.append([item])
     return clusters
 
 
@@ -392,9 +448,14 @@ def build_peak_map(
     frames: dict[str, pd.DataFrame],
     current_price: float,
     settings: dict | None = None,
+    evidence_cache: dict | None = None,
 ) -> PeakMap:
     settings = settings or {}
-    evidence, volume_available = _build_peak_evidence(frames, settings)
+    evidence, volume_available = _build_peak_evidence(
+        frames,
+        settings,
+        evidence_cache,
+    )
     max_distance_pct = float(settings.get("max_distance_pct", 5.0)) / 100
     evidence = [
         point
@@ -508,7 +569,7 @@ def assess_peak_liquidity(
             same_session_weekdays = weekday_prior[
                 weekday_prior.index.hour.isin(recent_clock_hours)
             ]
-            if len(same_session_weekdays) >= 12:
+            if len(same_session_weekdays) >= 24:
                 baseline_source = same_session_weekdays
             elif len(weekday_prior) >= 12:
                 baseline_source = weekday_prior
@@ -542,7 +603,7 @@ def assess_peak_liquidity(
         entries_allowed = False
         status = "THẤP / CUỐI TUẦN"
         ratio_text = (
-            f"; volume 1H gần đây bằng {volume_ratio:.0%} median ngày thường"
+            f"; volume 1H gần đây bằng {volume_ratio:.0%} median cùng giờ ngày thường"
             if volume_ratio is not None
             else ""
         )
@@ -554,7 +615,7 @@ def assess_peak_liquidity(
         entries_allowed = False
         status = "THẤP"
         reason = (
-            f"Thanh khoản 1H chỉ bằng {volume_ratio:.0%} median ngày thường, "
+            f"Thanh khoản 1H chỉ bằng {volume_ratio:.0%} median cùng giờ ngày thường, "
             "không đủ để xác nhận phá/retest."
         )
     elif spread_bps is not None and spread_bps > maximum_spread_bps:
@@ -567,7 +628,7 @@ def assess_peak_liquidity(
         entries_allowed = True
         status = "TỐT" if volume_ratio is not None and volume_ratio >= 0.8 else "BÌNH THƯỜNG"
         ratio_text = (
-            f"Volume 1H bằng {volume_ratio:.0%} median ngày thường."
+            f"Volume 1H bằng {volume_ratio:.0%} median cùng giờ ngày thường."
             if volume_ratio is not None
             else "Chưa đủ lịch sử để so volume ngày thường."
         )
@@ -585,6 +646,218 @@ def assess_peak_liquidity(
     )
 
 
+def assess_liquidity_traps(
+    peak_map: PeakMap,
+    frame_15m: pd.DataFrame,
+    settings: dict | None = None,
+) -> LiquidityTrapAssessment:
+    """Detect price-action symptoms of sweeps and late FOMO on closed 15m bars.
+
+    This deliberately describes observable price/volume behaviour. It does not claim
+    to identify a particular fund, market maker, or manipulator behind the move.
+    """
+    settings = settings or {}
+    lookback = max(3, int(settings.get("sweep_lookback_bars", 8)))
+    recent = frame_15m.tail(lookback).copy()
+    atr = max(
+        float(_atr_series(frame_15m).iloc[-1]),
+        peak_map.current_price * 0.0001,
+    )
+    sweep_buffer = max(
+        atr * float(settings.get("sweep_buffer_atr", 0.08)),
+        peak_map.current_price * 0.00005,
+    )
+    minimum_wick_ratio = max(
+        0.20,
+        min(0.80, float(settings.get("minimum_wick_ratio", 0.38))),
+    )
+
+    ranges = (recent["high"] - recent["low"]).clip(lower=1e-9)
+    upper_wicks = recent["high"] - recent[["open", "close"]].max(axis=1)
+    lower_wicks = recent[["open", "close"]].min(axis=1) - recent["low"]
+
+    resistance = (
+        peak_map.resistance_zones[0] if peak_map.resistance_zones else None
+    )
+    support = (
+        peak_map.converted_support_zones[0]
+        if peak_map.converted_support_zones
+        else None
+    )
+    buy_side_sweep = False
+    if resistance is not None:
+        buy_side_sweep = bool(
+            (
+                (recent["high"] > resistance.upper + sweep_buffer)
+                & (recent["close"] < resistance.upper)
+                & (upper_wicks / ranges >= minimum_wick_ratio)
+            ).any()
+        )
+    sell_side_sweep = False
+    if support is not None:
+        sell_side_sweep = bool(
+            (
+                (recent["low"] < support.lower - sweep_buffer)
+                & (recent["close"] > support.lower)
+                & (lower_wicks / ranges >= minimum_wick_ratio)
+            ).any()
+        )
+    double_sweep = buy_side_sweep and sell_side_sweep
+
+    volume_ratio = None
+    if "volume" in recent.columns and len(frame_15m) >= 21:
+        volume = pd.to_numeric(frame_15m["volume"], errors="coerce")
+        baseline = float(volume.iloc[-21:-1].median())
+        latest_volume = float(volume.iloc[-1])
+        if pd.notna(baseline) and pd.notna(latest_volume) and baseline > 0:
+            volume_ratio = latest_volume / baseline
+
+    latest = recent.iloc[-1]
+    latest_range = max(float(latest["high"] - latest["low"]), 1e-9)
+    latest_body = abs(float(latest["close"] - latest["open"]))
+    latest_range_atr = latest_range / atr
+    ema21 = float(
+        EMAIndicator(frame_15m["close"], window=21).ema_indicator().iloc[-1]
+    )
+    ema_extension_atr = abs(float(latest["close"]) - ema21) / atr
+    fomo_extension = bool(
+        (
+            latest_range_atr
+            >= float(settings.get("maximum_entry_candle_range_atr", 2.20))
+            and latest_body / latest_range
+            >= float(settings.get("minimum_fomo_body_ratio", 0.68))
+        )
+        or ema_extension_atr
+        >= float(settings.get("maximum_ema_extension_atr", 1.80))
+    )
+
+    reasons = []
+    if double_sweep:
+        reasons.append("đã quét cả hai phía trong cửa sổ gần nhất")
+    elif buy_side_sweep:
+        reasons.append("có dấu hiệu quét thanh khoản phía trên rồi đóng trở lại")
+    elif sell_side_sweep:
+        reasons.append("có dấu hiệu quét thanh khoản phía dưới rồi đóng trở lại")
+    if fomo_extension:
+        reasons.append(
+            f"nến/giá đang giãn {latest_range_atr:.2f} ATR, xa EMA21 {ema_extension_atr:.2f} ATR"
+        )
+    if volume_ratio is not None:
+        reasons.append(f"volume nến cuối bằng {volume_ratio:.0%} median 20 nến trước")
+    if not reasons:
+        reasons.append("chưa thấy sweep hai đầu hoặc nến FOMO quá giãn")
+    return LiquidityTrapAssessment(
+        buy_side_sweep=buy_side_sweep,
+        sell_side_sweep=sell_side_sweep,
+        double_sweep=double_sweep,
+        fomo_extension=fomo_extension,
+        volume_ratio=volume_ratio,
+        latest_range_atr=latest_range_atr,
+        ema_extension_atr=ema_extension_atr,
+        reason="; ".join(reasons),
+    )
+
+
+def assess_setup_quality(
+    gate: PeakTradeGate,
+    execution_plan: PeakExecutionPlan | None,
+    liquidity: PeakLiquidityAssessment,
+    trap: LiquidityTrapAssessment,
+    macro_risk,
+    settings: dict | None = None,
+) -> SetupQualityAssessment:
+    """Score rule completion from 0..100; this is explicitly not a win probability."""
+    settings = settings or {}
+    is_long = gate.allowed_decision == "CANH LONG"
+    trigger_confirmed = (
+        gate.long_retest_confirmed if is_long else gate.short_rejection_confirmed
+    )
+    zone_score = gate.resistance.score if gate.resistance is not None else 0
+    zone_points = min(10, max(0, round((zone_score - 3) / 9 * 10)))
+
+    if not liquidity.entries_allowed:
+        liquidity_points = 0
+    else:
+        ratio = liquidity.volume_ratio
+        liquidity_points = 4 if ratio is None else 8 if ratio >= 1.0 else 6 if ratio >= 0.8 else 4
+        if liquidity.spread_bps is not None:
+            liquidity_points += 2 if liquidity.spread_bps <= 1.5 else 1
+        liquidity_points = min(10, liquidity_points)
+
+    rr = execution_plan.reward_risk_2 if execution_plan is not None else 0.0
+    rr_points = 12 if rr >= 2.5 else 10 if rr >= 2.0 else 8 if rr >= 1.5 else 0
+    if trap.double_sweep or trap.fomo_extension:
+        trap_points = 0
+    elif (is_long and trap.sell_side_sweep) or (
+        not is_long and trap.buy_side_sweep
+    ):
+        trap_points = 7
+    else:
+        trap_points = 4
+
+    factors = {
+        "multi_timeframe_alignment": 18 if gate.multi_timeframe_aligned else 0,
+        "closed_15m_trigger": 18 if trigger_confirmed else 0,
+        "closed_1h_confirmation": 12 if gate.hourly_confirmed else 0,
+        "daily_context": 8 if gate.daily_confirmed else 0,
+        "zone_reliability": zone_points,
+        "volume_liquidity_spread": liquidity_points,
+        "structural_reward_risk": rr_points,
+        "entry_location": 5 if gate.near_resistance_confirmed else 0,
+        "sweep_fomo_context": trap_points,
+    }
+    score = min(100, sum(factors.values()))
+    blockers: list[str] = []
+    if gate.allowed_decision not in ("CANH LONG", "CANH SHORT"):
+        blockers.append(gate.reason)
+    if execution_plan is None:
+        blockers.append("chưa có Entry/SL/TP cấu trúc hợp lệ")
+    if not liquidity.entries_allowed:
+        blockers.append(liquidity.reason)
+    if getattr(macro_risk, "blocked", False):
+        blockers.append(getattr(macro_risk, "reason", "đang trong cửa sổ tin mạnh"))
+    if trap.double_sweep:
+        blockers.append("giá vừa quét cả hai đầu, cấu trúc chưa sạch")
+    if trap.fomo_extension:
+        blockers.append("giá/nến đã giãn quá xa theo ATR, không đuổi FOMO")
+
+    minimum_score = max(1, min(100, int(settings.get("minimum_trade_score", 70))))
+    actionable = not blockers and score >= minimum_score
+    base_risk = max(0.0, float(settings.get("base_risk_per_trade_pct", 0.5)))
+    if score >= 90:
+        tier = "S · 90+"
+        recommendation = "SETUP RẤT CHỌN LỌC"
+        tier_risk = float(settings.get("risk_pct_score_90", 0.50))
+    elif score >= 80:
+        tier = "A · 80–89"
+        recommendation = "CÓ THỂ ĐÁNH NHỎ"
+        tier_risk = float(settings.get("risk_pct_score_80", 0.35))
+    elif score >= 70:
+        tier = "B · 70–79"
+        recommendation = "CHỈ THĂM DÒ"
+        tier_risk = float(settings.get("risk_pct_score_70", 0.20))
+    else:
+        tier = "C · <70"
+        recommendation = "ĐỨNG NGOÀI"
+        tier_risk = 0.0
+    if not actionable:
+        recommendation = "ĐỨNG NGOÀI"
+        tier_risk = 0.0
+    paper_only = bool(settings.get("paper_only", True))
+    if actionable and paper_only:
+        recommendation = "PAPER · " + recommendation
+    return SetupQualityAssessment(
+        score=score,
+        tier=tier,
+        recommendation=recommendation,
+        recommended_risk_pct=min(base_risk, max(0.0, tier_risk)),
+        actionable=actionable,
+        paper_only=paper_only,
+        factors=factors,
+        blockers=tuple(dict.fromkeys(blockers)),
+    )
+
+
 def assess_peak_trade_gate(
     peak_map: PeakMap,
     frame_15m: pd.DataFrame,
@@ -593,63 +866,19 @@ def assess_peak_trade_gate(
     frame_1h: pd.DataFrame | None = None,
     liquidity: PeakLiquidityAssessment | None = None,
     daily_pattern: str | None = None,
+    trap: LiquidityTrapAssessment | None = None,
+    macro_risk=None,
 ) -> PeakTradeGate:
     """Allow a directional AI review only after closed-bar structural confirmation."""
     settings = settings or {}
-    resistance = peak_map.resistance_zones[0] if peak_map.resistance_zones else None
     support = (
         peak_map.converted_support_zones[0]
         if peak_map.converted_support_zones
         else None
     )
-    if resistance is None:
-        return PeakTradeGate(
-            "CHỜ",
-            "Không có vùng cản trên đã xác nhận đủ gần.",
-            None,
-            support,
-            False,
-            False,
-            False,
-        )
-
     recent = frame_15m.tail(max(4, int(settings.get("ai_review_bars", 8))))
     atr = max(float(_atr_series(frame_15m).iloc[-1]), peak_map.current_price * 0.0001)
     tolerance = max(atr * 0.15, peak_map.current_price * 0.0001)
-
-    breakout_at = None
-    for position in range(1, len(recent)):
-        if (
-            float(recent["close"].iloc[position - 1]) <= resistance.upper
-            and float(recent["close"].iloc[position]) > resistance.upper
-        ):
-            breakout_at = position
-    long_retest = False
-    if breakout_at is not None and breakout_at + 1 < len(recent):
-        after_breakout = recent.iloc[breakout_at + 1 :]
-        long_retest = bool(
-            (
-                (after_breakout["low"] <= resistance.upper + tolerance)
-                & (after_breakout["low"] >= resistance.lower - tolerance)
-                & (after_breakout["close"] > resistance.upper)
-            ).any()
-        )
-
-    latest_two = recent.tail(2)
-    candle_range = (latest_two["high"] - latest_two["low"]).clip(lower=1e-9)
-    body = (latest_two["close"] - latest_two["open"]).abs()
-    upper_wick = latest_two["high"] - latest_two[["open", "close"]].max(axis=1)
-    touched = (latest_two["high"] >= resistance.lower) & (
-        latest_two["low"] <= resistance.upper
-    )
-    short_rejection = bool(
-        (
-            touched
-            & (latest_two["close"] < resistance.lower)
-            & (latest_two["close"] < latest_two["open"])
-            & ((upper_wick >= body) | (body / candle_range >= 0.55))
-        ).any()
-    )
 
     required = ("15min", "1h", "4h")
     minimum_score = float(settings.get("minimum_timeframe_score", 0.12))
@@ -661,6 +890,93 @@ def assess_peak_trade_gate(
         momentum_scores.get(timeframe, 0.0) <= -minimum_score
         for timeframe in required
     )
+
+    # A LONG retest happens after the broken resistance has become support. Keep
+    # those converted zones eligible; otherwise the setup disappears precisely
+    # when price moves into the long entry band above zone.upper.
+    all_focus_zones: list[PeakZone] = []
+    seen_zone_ids: set[tuple[float, float, object]] = set()
+    for zone in [
+        *peak_map.converted_support_zones,
+        *peak_map.resistance_zones,
+    ]:
+        identity = (round(zone.lower, 6), round(zone.upper, 6), zone.newest_at)
+        if identity not in seen_zone_ids:
+            all_focus_zones.append(zone)
+            seen_zone_ids.add(identity)
+
+    def long_retest_for(zone: PeakZone) -> bool:
+        breakout_at = None
+        for position in range(1, len(recent)):
+            if (
+                float(recent["close"].iloc[position - 1]) <= zone.upper
+                and float(recent["close"].iloc[position]) > zone.upper
+            ):
+                breakout_at = position
+        if breakout_at is None or breakout_at + 1 >= len(recent):
+            return False
+        after_breakout = recent.iloc[breakout_at + 1 :]
+        return bool(
+            (
+                (after_breakout["low"] <= zone.upper + tolerance)
+                & (after_breakout["low"] >= zone.lower - tolerance)
+                & (after_breakout["close"] > zone.upper)
+            ).any()
+        )
+
+    def short_rejection_for(zone: PeakZone) -> bool:
+        latest_two = recent.tail(2)
+        candle_range = (latest_two["high"] - latest_two["low"]).clip(lower=1e-9)
+        body = (latest_two["close"] - latest_two["open"]).abs()
+        upper_wick = latest_two["high"] - latest_two[["open", "close"]].max(axis=1)
+        touched = (latest_two["high"] >= zone.lower) & (
+            latest_two["low"] <= zone.upper
+        )
+        return bool(
+            (
+                touched
+                & (latest_two["close"] < zone.lower)
+                & (latest_two["close"] < latest_two["open"])
+                & ((upper_wick >= body) | (body / candle_range >= 0.55))
+            ).any()
+        )
+
+    def near(zone: PeakZone) -> bool:
+        return (
+            zone.lower - atr * 0.30
+            <= peak_map.current_price
+            <= zone.upper + atr * 0.30
+        )
+
+    if long_aligned:
+        confirmed_long_zones = [
+            zone for zone in all_focus_zones if long_retest_for(zone) and near(zone)
+        ]
+        resistance = (
+            min(
+                confirmed_long_zones,
+                key=lambda zone: abs(zone.center - peak_map.current_price),
+            )
+            if confirmed_long_zones
+            else support
+            or (peak_map.resistance_zones[0] if peak_map.resistance_zones else None)
+        )
+    else:
+        resistance = peak_map.resistance_zones[0] if peak_map.resistance_zones else None
+
+    if resistance is None:
+        return PeakTradeGate(
+            "CHỜ",
+            "Không có vùng cản/hỗ trợ retest đã xác nhận đủ gần.",
+            None,
+            support,
+            False,
+            False,
+            long_aligned or short_aligned,
+        )
+
+    long_retest = long_retest_for(resistance)
+    short_rejection = short_rejection_for(resistance)
     current_near_resistance = (
         resistance.lower - atr * 0.30
         <= peak_map.current_price
@@ -683,6 +999,8 @@ def assess_peak_trade_gate(
         hourly_long_confirmed = not require_hourly_close
         hourly_short_confirmed = not require_hourly_close
     liquidity_confirmed = liquidity is None or liquidity.entries_allowed
+    trap_clear = trap is None or not (trap.double_sweep or trap.fomo_extension)
+    macro_clear = macro_risk is None or not getattr(macro_risk, "blocked", False)
     require_daily_context = bool(settings.get("require_daily_context", True))
     daily_opposition_limit = max(
         0.0,
@@ -704,6 +1022,8 @@ def assess_peak_trade_gate(
         and hourly_long_confirmed
         and daily_long_confirmed
         and liquidity_confirmed
+        and trap_clear
+        and macro_clear
         and current_near_resistance
     ):
         return PeakTradeGate(
@@ -717,6 +1037,7 @@ def assess_peak_trade_gate(
             True,
             True,
             True,
+            True,
         )
     if (
         short_rejection
@@ -724,6 +1045,8 @@ def assess_peak_trade_gate(
         and hourly_short_confirmed
         and daily_short_confirmed
         and liquidity_confirmed
+        and trap_clear
+        and macro_clear
         and current_near_resistance
     ):
         return PeakTradeGate(
@@ -737,9 +1060,14 @@ def assess_peak_trade_gate(
             True,
             True,
             True,
+            True,
         )
 
-    if not liquidity_confirmed:
+    if not macro_clear:
+        reason = macro_risk.reason
+    elif not trap_clear:
+        reason = trap.reason
+    elif not liquidity_confirmed:
         reason = liquidity.reason
     elif not (long_aligned or short_aligned):
         reason = "Ba khung 15m/1H/4H chưa đồng thuận cùng hướng."
@@ -786,6 +1114,7 @@ def assess_peak_trade_gate(
             if short_aligned
             else False
         ),
+        current_near_resistance,
     )
 
 

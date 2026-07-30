@@ -225,3 +225,45 @@ def compute_momentum_bias(df: pd.DataFrame, weights: dict) -> MomentumBias:
         label = "Trung lap / di ngang"
 
     return MomentumBias(price=float(close.iloc[-1]), composite=float(composite), label=label, components=components)
+
+
+def compute_momentum_bias_series(df: pd.DataFrame, weights: dict) -> pd.DataFrame:
+    """Vectorized equivalent of compute_momentum_bias for point-in-time replay."""
+    close, high, low = df["close"], df["high"], df["low"]
+    atr = AverageTrueRange(high, low, close, window=14).average_true_range()
+    atr = atr.mask(atr <= 1e-9, 1e-9)
+    rsi = RSIIndicator(close, window=14).rsi()
+    rsi_score = ((rsi - 50) / 25).clip(-1.0, 1.0)
+    macd_ind = MACD(close, window_slow=26, window_fast=12, window_sign=9)
+    macd_hist = macd_ind.macd() - macd_ind.macd_signal()
+    macd_score = (macd_hist / atr).clip(-1.0, 1.0)
+    ema_fast = EMAIndicator(close, window=9).ema_indicator()
+    ema_slow = EMAIndicator(close, window=21).ema_indicator()
+    ema_score = ((ema_fast - ema_slow) / atr).clip(-1.0, 1.0)
+    bb = BollingerBands(close, window=20, window_dev=2)
+    mid = bb.bollinger_mavg()
+    half_width = (bb.bollinger_hband() - mid).mask(lambda value: value <= 1e-9, 1e-9)
+    bollinger_score = ((close - mid) / half_width).clip(-1.0, 1.0)
+    component_weights = {
+        "rsi": weights.get("rsi", 1.0),
+        "macd": weights.get("macd", 1.2),
+        "ema_trend": weights.get("ema_crossover", 1.0),
+        "bollinger": weights.get("bollinger", 0.8),
+    }
+    total_weight = sum(component_weights.values())
+    composite = (
+        rsi_score * component_weights["rsi"]
+        + macd_score * component_weights["macd"]
+        + ema_score * component_weights["ema_trend"]
+        + bollinger_score * component_weights["bollinger"]
+    ) / total_weight
+    return pd.DataFrame(
+        {
+            "rsi": rsi_score,
+            "macd": macd_score,
+            "ema_trend": ema_score,
+            "bollinger": bollinger_score,
+            "composite": composite,
+        },
+        index=df.index,
+    )

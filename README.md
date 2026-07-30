@@ -32,6 +32,14 @@ Lần chạy đầu sẽ tải dữ liệu lịch sử từ Twelve Data (tốn v
 
 **Giới hạn:** kết quả XAU/USD không chứng minh edge cho hợp đồng XAUUSDT mới trên Binance. Chỉ xem đây là kiểm tra logic; muốn đánh giá chiến lược live phải backtest lại bằng lịch sử Binance từ ngày hợp đồng được niêm yết.
 
+Replay đúng luồng `/dinh` trên dữ liệu 15m Binance (chỉ dùng nến đã đóng, Limit chỉ được khớp từ nến kế tiếp, tính phí/trượt giá/spread):
+
+```bash
+python run_peak_backtest.py
+```
+
+Kết quả có `win_rate_95pct_wilson`, thống kê riêng từng tier và cờ `validation.passed`. Mặc định `setup_quality.paper_only: true`; chỉ cân nhắc tắt sau ít nhất 100 lệnh out-of-sample/forward, profit factor và expectancy sau chi phí đều đạt ngưỡng cấu hình. Điểm 70/80/90 là **độ hoàn thiện setup, không phải tỷ lệ thắng**.
+
 ## 3. Kiểm tra tín hiệu live (chưa gửi Telegram)
 
 ```bash
@@ -56,7 +64,8 @@ Một tiến trình `telegram_query_bot.py` vừa trả lời lệnh, vừa tự
    - `/canh` — xem lần kiểm tra, gate/lý do và lỗi gần nhất.
    - `/canhbat` / `/canhtat` — bật hoặc tắt canh nền mà không dừng bot.
    - Cùng một setup được chống gửi lặp; có thể báo hai giai đoạn `SÁT ENTRY` và `ĐÃ VÀO ENTRY`.
-   - Cảnh báo tự động không gọi AI nên không tốn quota Groq/Gemini; nó gửi Entry/SL/TP/khối lượng/cách đặt lệnh và biểu đồ 15m/1H/D1 từ code định lượng.
+   - Cảnh báo định lượng được gửi trước; nếu `auto_alerts.ai_review_after_alert` bật, bot gọi AI ở tác vụ riêng và có dùng quota. Vòng canh giá nhanh sau đó không gọi AI.
+   - Mặc định cảnh báo ghi rõ `PAPER ONLY`, mô phỏng chạm Entry/SL/TP và hướng dẫn ghi journal; không hướng dẫn đặt lệnh thật cho đến khi người vận hành chủ động tắt paper mode sau kiểm định.
 6. Trong Telegram, nhắn `/signal` hoặc `/gia` cho bot → nhận ngay:
    - Giá bid/ask realtime từ Binance WebSocket; Last, Mark, Index, funding và open interest từ public Futures API.
    - Entry/vùng giá dựa trên nến giao dịch XAUUSDT; Mark Price dùng để theo dõi rủi ro PnL chưa thực hiện/thanh lý; Index và basis dùng để phát hiện lệch giá.
@@ -83,6 +92,14 @@ Một tiến trình `telegram_query_bot.py` vừa trả lời lệnh, vừa tự
 
    Chỉ chat có `chat_id` khớp trong `.env` mới được bot trả lời (người khác nhắn bot sẽ bị bỏ qua, tránh lộ và tốn quota API).
 
+8. Theo dõi một vị thế đã tự mở trên Binance:
+   - `/long:100_5x` hoặc `/long 100 5x` — ghi nhận LONG với 100 USDT ký quỹ, đòn bẩy 5x.
+   - `/short:100_5x` — ghi nhận SHORT; bot cũng chấp nhận alias gõ nhầm `/sort:100_5x` hoặc `sort:100_5x`.
+   - Bot lấy bid/ask tại lúc nhận lệnh làm Entry **tham chiếu**, tính notional = ký quỹ × đòn bẩy, khối lượng XAU, PnL/ROE ước tính sau phí/trượt giá và SL/TP theo ATR 15m.
+   - Giá được kiểm tra mỗi 10 giây. Cập nhật thường gửi theo chu kỳ; khi SL, TP2 hoặc hòa vốn sau TP1 kích hoạt, cảnh báo đóng lệnh lặp mỗi 30 giây cho đến `/dong`, kể cả khi giá sau đó hồi lại.
+   - `/vithe` — xem trạng thái/PnL ngay. `/dong` — dừng monitor và xóa trạng thái đã lưu.
+   - Bot không đọc tài khoản và không biết lệnh thật đã fill/đóng. `/dong` **không đóng lệnh Binance**; người dùng phải tự xác nhận vị thế, SL/TP và lệnh chờ trên sàn.
+
 **Quan trọng:** hỗ trợ/kháng cự và retest chỉ làm giảm việc đuổi giá, không biến tín hiệu thành dự đoán chắc chắn. Dữ liệu đúng sàn loại bỏ sai lệch nguồn nhưng không tạo ra edge; không dùng riêng bot hoặc AI làm căn cứ vào lệnh đòn bẩy.
 
 ### (Tuỳ chọn) Cách cũ: bot tự poll và đẩy tin khi tín hiệu đổi
@@ -106,6 +123,11 @@ python main.py             # chạy thật, đẩy tin khi tín hiệu đổi tr
 - `peak_execution` — đệm Entry/SL theo ATR và R:R cấu trúc tối thiểu trước khi `/dinh` được phép sinh kế hoạch.
 - SL cấu trúc bị giới hạn tối đa khoảng 7 giá tính từ mọi điểm khớp trong vùng Entry; nếu cần xa hơn bot bỏ kèo. Sau khi khớp, nến 1m đóng sai phía vùng retest kèm áp lực ngược sẽ phát cảnh báo `RETEST THẤT BẠI — CẮT NGAY`, không chờ hard SL.
 - `peak_liquidity` — tỷ lệ volume tối thiểu, spread tối đa và chính sách chặn Entry cuối tuần.
+- `liquidity_traps` — nhận diện dấu hiệu sweep hai đầu và nến FOMO theo ATR/râu nến/volume; đây chỉ là triệu chứng thị trường, không xác định được “quỹ lớn” nào đứng sau.
+- `setup_quality` — tier C/B/A/S theo điểm 0–100 và trần risk mô phỏng; `paper_only` mặc định bật.
+- `macro_guard` — tự đọc lịch FOMC chính thức và chặn setup quanh sự kiện; thêm CPI/NFP/PCE/BoE/NBS vào `manual_events` theo UTC khi lịch chính thức được công bố.
+- `backtest.validation` — số lệnh, profit factor và expectancy tối thiểu để báo đã đủ điều kiện kiểm định; không tự tắt `paper_only`.
+- `manual_position` — monitor một vị thế do người dùng khai báo: chu kỳ 10 giây, ATR/SL/TP, khoảng lặp cảnh báo, giới hạn dữ liệu ký quỹ/đòn bẩy và file trạng thái để tiếp tục sau khi bot restart.
 - `auto_alerts` — quét cấu trúc nền mỗi 30 giây; khi có setup LONG/SHORT bot gửi cảnh báo code ngay, gọi AI ở tác vụ riêng để gửi thông báo xác thực thứ hai, rồi canh giá mỗi 10 giây. Nến 1m cập nhật mỗi phút; vòng canh nhanh không gọi AI.
 
 ## 6. Cấu trúc project
@@ -118,4 +140,5 @@ alerting/                # gửi cảnh báo Telegram (dùng bởi main.py)
 main.py                  # (tuỳ chọn) vòng lặp polling live, tự đẩy tin khi tín hiệu đổi
 telegram_query_bot.py    # bot hỏi-đáp /signal, /gia, /dinh — cách dùng chính
 run_backtest.py          # chạy backtest
+run_peak_backtest.py     # replay point-in-time đúng logic /dinh trên XAUUSDT
 ```

@@ -31,7 +31,9 @@ trading_plan:
   minimum_quantity: 0.001
   minimum_notional_usdt: 5
   minimum_bias: 0.25
-  slippage_fee_buffer_pct: 10
+  # Uoc tinh theo notional, bao thu hon buffer % khoang SL cu. Can doi chieu fee tier tai khoan.
+  estimated_round_trip_fee_pct: 0.10
+  estimated_slippage_bps: 2.0
   take_profit_1_r: 1.0
   take_profit_2_r: 2.0
   moderate_bias_holding_bars: 8
@@ -57,6 +59,12 @@ signal_confirmation:
 peak_map:
   timeframes: ["15min", "1h", "4h", "1day"]
   outputsize: 200
+  # Them lich su cho baseline volume theo gio va swing lon; moi request van duoi limit 1500 cua Binance.
+  outputsize_by_timeframe:
+    15min: 500
+    1h: 1000
+    4h: 600
+    1day: 300
   fractal_span: 2
   # ZigZag chỉ cộng điểm cho swing đã đảo chiều đủ xa; khung lớn dùng ngưỡng lớn hơn.
   zigzag_reversal_pct:
@@ -90,9 +98,77 @@ peak_liquidity:
   # Cho phep Entry den truoc 05:00 sang thu Bay, theo gio Viet Nam.
   weekend_cutoff_hour_vn: 5
   recent_volume_hours: 6
-  volume_baseline_hours: 168
+  volume_baseline_hours: 720
   minimum_volume_ratio: 0.45
   maximum_spread_bps: 3.0
+
+# Chi mo ta dau hieu gia/volume; khong khang dinh quy lon hay market maker dung sau bien dong.
+liquidity_traps:
+  sweep_lookback_bars: 8
+  sweep_buffer_atr: 0.08
+  minimum_wick_ratio: 0.38
+  maximum_entry_candle_range_atr: 2.20
+  minimum_fomo_body_ratio: 0.68
+  maximum_ema_extension_atr: 1.80
+
+# Diem 90/80/70 la do hoan thien setup, KHONG phai % thang.
+setup_quality:
+  # Chi tat sau khi co >=100 lenh out-of-sample/forward va ket qua sau phi dat nguong chap nhan.
+  paper_only: true
+  minimum_trade_score: 70
+  risk_pct_score_90: 0.50
+  risk_pct_score_80: 0.35
+  risk_pct_score_70: 0.20
+
+# Lich FOMC lay tu Federal Reserve va cache 6h. Them CPI/NFP/PCE/BoE/NBS vao manual_events
+# khi co lich UTC chinh thuc; trong cua so HIGH bot khong sinh Entry moi.
+macro_guard:
+  enabled: true
+  fetch_fomc_calendar: true
+  fomc_calendar_url: "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm"
+  # FOMC statement thuong luc 14:00 New York; code tu doi 18/19 UTC theo DST.
+  fomc_decision_hour_et: 14
+  block_minutes_before: 720
+  block_minutes_after: 360
+  calendar_cache_hours: 6
+  timeout_seconds: 10
+  fail_closed_if_calendar_unavailable: true
+  # Vi du:
+  # manual_events:
+  #   - {name: "US CPI", at_utc: "2026-08-12T12:30:00Z", source: "https://www.bls.gov/schedule/"}
+  manual_events: []
+
+backtest:
+  assumed_spread_bps: 1.0
+  minimum_daily_bars: 40
+  validation:
+    minimum_trades: 100
+    minimum_profit_factor: 1.20
+    minimum_average_net_r: 0.0
+
+# Theo doi mot vi the nguoi dung da tu vao. Bot khong doc tai khoan va khong tu dong dong lenh.
+manual_position:
+  enabled: true
+  poll_seconds: 10
+  state_path: "logs/manual_position_state.json"
+  atr_bars: 100
+  stop_atr_multiplier: 0.80
+  minimum_stop_distance_pct: 0.05
+  maximum_stop_distance: 7.0
+  take_profit_1_r: 1.0
+  take_profit_2_r: 2.0
+  loss_warning_r: 0.50
+  profit_reminder_r: 0.50
+  close_repeat_seconds: 30
+  reminder_interval_seconds: 180
+  status_interval_seconds: 300
+  error_backoff_seconds: 30
+  error_notice_seconds: 300
+  minimum_margin_usdt: 1.0
+  maximum_margin_usdt: 1000000
+  # Chi la gioi han du lieu dau vao de theo doi, khong phai khuyen nghi dung don bay cao.
+  maximum_leverage: 125
+  high_leverage_warning_x: 10
 
 auto_alerts:
   enabled: true
@@ -120,6 +196,18 @@ auto_alerts:
   error_backoff_seconds: 60
   send_hourly_chart: true
   state_path: "logs/auto_alert_state.json"
+
+# Dataset de xem lai vi sao bot bao/khong bao. Moi snapshot la JSON tren mot dong.
+analysis_diagnostics:
+  enabled: true
+  directory: "logs/diagnostics"
+  retention_days: 365
+  max_file_mb: 10
+  recent_closed_candles:
+    15min: 8
+    1h: 6
+    4h: 4
+    1day: 3
 
 news:
   max_items: 4
