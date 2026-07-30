@@ -28,10 +28,20 @@ class ManualPositionMonitorTests(unittest.TestCase):
         }
 
     def test_parser_accepts_requested_aliases_and_telegram_command(self):
-        self.assertEqual(parse_manual_position_command("/long:100_5x"), ("LONG", 100.0, 5))
-        self.assertEqual(parse_manual_position_command("/short 25,5 10x"), ("SHORT", 25.5, 10))
-        self.assertEqual(parse_manual_position_command("sort:40_3x"), ("SHORT", 40.0, 3))
-        self.assertIsNone(parse_manual_position_command("/long:abc_5x"))
+        self.assertEqual(
+            parse_manual_position_command("/long:100:3350:5x"),
+            ("LONG", 100.0, 3350.0, 5),
+        )
+        self.assertEqual(
+            parse_manual_position_command("/short 25,5 3998,75 10x"),
+            ("SHORT", 25.5, 3998.75, 10),
+        )
+        self.assertEqual(
+            parse_manual_position_command("sort:40:4000:3x"),
+            ("SHORT", 40.0, 4000.0, 3),
+        )
+        self.assertIsNone(parse_manual_position_command("/long:100_5x"))
+        self.assertIsNone(parse_manual_position_command("/long:abc:3350:5x"))
 
     def test_long_position_uses_margin_times_leverage_and_atr_levels(self):
         position = build_manual_position_state(

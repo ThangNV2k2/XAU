@@ -1,5 +1,8 @@
+import json
+import tempfile
 import unittest
 from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -18,6 +21,7 @@ from peak_analysis import (
     assess_peak_trade_gate,
     assess_setup_quality,
 )
+from telegram_query_bot import format_peak_backtest_evidence
 
 
 def zone(lower: float, upper: float, status: str) -> PeakZone:
@@ -214,6 +218,30 @@ class StrategyGuardTests(unittest.TestCase):
         lower, upper = interval
         self.assertLess(lower, 0.10)
         self.assertGreater(upper, 0.70)
+
+    def test_live_backtest_evidence_reports_rate_and_small_sample_warning(self):
+        trades = [
+            {"tier": "S · 90+", "net_r": 1.2},
+            {"tier": "S · 90+", "net_r": -1.0},
+            {"tier": "A · 80–89", "net_r": -0.5},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            trades_path = Path(directory) / "trades.json"
+            trades_path.write_text(json.dumps(trades), encoding="utf-8")
+            text = format_peak_backtest_evidence(
+                {
+                    "setup_quality": {
+                        "backtest_summary_path": str(Path(directory) / "missing.json"),
+                        "backtest_trades_path": str(trades_path),
+                    },
+                    "backtest": {"validation": {"minimum_trades": 100}},
+                },
+                "S · 90+",
+            )
+        self.assertIn("1/2 = 50.0%", text)
+        self.assertIn("CI95%", text)
+        self.assertIn("CHƯA ĐỦ MẪU 3/100", text)
+        self.assertIn("không dùng như cam kết", text)
 
 
 if __name__ == "__main__":

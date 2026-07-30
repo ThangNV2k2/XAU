@@ -74,6 +74,7 @@ Một tiến trình `telegram_query_bot.py` vừa trả lời lệnh, vừa tự
    - Vùng hỗ trợ/kháng cự động từ swing-high, swing-low đa khung và ATR. Hai vùng được tách rời; vùng nhiễu không được dùng làm entry.
    - Trạng thái breakout/breakdown và retest. Bot chỉ lập Entry/SL/TP/khối lượng/đòn bẩy khi đủ chuỗi: ba khung đồng thuận → nến 15m đóng phá vùng → nến sau retest xác nhận → tín hiệu backtest gần đây cùng hướng → giá hiện vẫn ở vùng vào.
    - `/gia` và `/dinh` cùng dùng bộ lọc thanh khoản 1H; cuối tuần hoặc khi volume/spread không đạt ngưỡng thì cả hai đều khóa Entry.
+   - `/gia` và `/dinh` dùng chung scorecard 0–100, tier S/A/B/C, sweep/FOMO, lịch tin vĩ mô và gate Entry. Cả hai hiển thị win rate backtest đúng tier kèm số mẫu và khoảng tin cậy 95%; nếu chưa đủ 100 lệnh thì ghi rõ `CHƯA ĐỦ MẪU`.
    - Phân tích AI mới từ Groq, tự chuyển sang Gemini nếu cần. Luồng `/gia` không tái sử dụng cache AI hoặc cache tin tức.
    - AI nhận ảnh gộp cùng 8 nến OHLC gần nhất của mỗi khung, vùng giá, động lượng và tin tiếng Việt. AI không tự gọi thêm dữ liệu và không được tự tạo hay sửa Entry/SL/TP; nếu code chưa xác nhận entry thì kết luận AI bị ép thành `ĐỨNG NGOÀI`.
 
@@ -88,14 +89,15 @@ Một tiến trình `telegram_query_bot.py` vừa trả lời lệnh, vừa tự
    - Khi đã xác nhận, code mới tính vùng Entry retest, SL ngoài vùng theo ATR, TP1 ở 1R và TP2 tại cản/hỗ trợ cấu trúc kế tiếp. Nếu TP2 không đạt tối thiểu 1.5R thì bot ghi `KHÔNG VÀO`.
    - Kế hoạch kèm khối lượng theo rủi ro tài khoản, đòn bẩy isolated, cách chốt 50% tại TP1, dời SL về Entry và time-stop. Khi chưa xác nhận, `/dinh` chỉ đưa mốc cần chờ và yêu cầu gọi lại sau nến 15m đóng.
    - Hướng dẫn thực thi ghi tuần tự cách đặt Limit Entry, Stop-Market theo Mark Price, TP1 50%, TP2 phần còn lại và hủy các lệnh đóng vị thế còn treo.
+   - Điểm 90/80/70 là độ hoàn thiện điều kiện. “Tỷ lệ thắng” chỉ lấy từ `logs/peak_backtest_summary.json` hoặc journal `logs/peak_backtest_trades.json`, không biến điểm setup thành xác suất giả.
    - Thanh khoản được đo bằng median volume 1H gần nhất so với median giờ ngày thường. Mặc định thứ Bảy/Chủ nhật chỉ vẽ vùng và không sinh Entry (`peak_liquidity.block_weekend_entries: true`).
 
    Chỉ chat có `chat_id` khớp trong `.env` mới được bot trả lời (người khác nhắn bot sẽ bị bỏ qua, tránh lộ và tốn quota API).
 
 8. Theo dõi một vị thế đã tự mở trên Binance:
-   - `/long:100_5x` hoặc `/long 100 5x` — ghi nhận LONG với 100 USDT ký quỹ, đòn bẩy 5x.
-   - `/short:100_5x` — ghi nhận SHORT; bot cũng chấp nhận alias gõ nhầm `/sort:100_5x` hoặc `sort:100_5x`.
-   - Bot lấy bid/ask tại lúc nhận lệnh làm Entry **tham chiếu**, tính notional = ký quỹ × đòn bẩy, khối lượng XAU, PnL/ROE ước tính sau phí/trượt giá và SL/TP theo ATR 15m.
+   - `/long:100:3350:5x` hoặc `/long 100 3350 5x` — ghi nhận LONG với 100 USDT ký quỹ, giá entry 3350 và đòn bẩy 5x.
+   - `/short:100:3350:5x` — ghi nhận SHORT; bot cũng chấp nhận alias gõ nhầm `/sort:100:3350:5x` hoặc `sort:100:3350:5x`.
+   - Bot dùng đúng giá Entry bạn khai báo, đồng thời lấy bid/ask hiện tại để theo dõi; notional = ký quỹ × đòn bẩy, sau đó tính khối lượng XAU, PnL/ROE ước tính sau phí/trượt giá và SL/TP theo ATR 15m.
    - Giá được kiểm tra mỗi 10 giây. Cập nhật thường gửi theo chu kỳ; khi SL, TP2 hoặc hòa vốn sau TP1 kích hoạt, cảnh báo đóng lệnh lặp mỗi 30 giây cho đến `/dong`, kể cả khi giá sau đó hồi lại.
    - `/vithe` — xem trạng thái/PnL ngay. `/dong` — dừng monitor và xóa trạng thái đã lưu.
    - Bot không đọc tài khoản và không biết lệnh thật đã fill/đóng. `/dong` **không đóng lệnh Binance**; người dùng phải tự xác nhận vị thế, SL/TP và lệnh chờ trên sàn.

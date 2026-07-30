@@ -115,6 +115,8 @@ liquidity_traps:
 setup_quality:
   # Chi tat sau khi co >=100 lenh out-of-sample/forward va ket qua sau phi dat nguong chap nhan.
   paper_only: true
+  backtest_summary_path: "logs/peak_backtest_summary.json"
+  backtest_trades_path: "logs/peak_backtest_trades.json"
   minimum_trade_score: 70
   risk_pct_score_90: 0.50
   risk_pct_score_80: 0.35

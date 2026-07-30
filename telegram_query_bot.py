@@ -254,6 +254,157 @@ class PeakOpportunity:
     sized_plan: TradingPlan | None
 
 
+def _wilson_percentage(wins: int, total: int) -> tuple[float, float] | None:
+    """Return a 95% Wilson interval as percentages for displayed win-rate evidence."""
+    if total <= 0:
+        return None
+    z = 1.96
+    proportion = wins / total
+    denominator = 1 + z * z / total
+    centre = proportion + z * z / (2 * total)
+    margin = z * math.sqrt(
+        proportion * (1 - proportion) / total + z * z / (4 * total * total)
+    )
+    return (
+        max(0.0, (centre - margin) / denominator) * 100,
+        min(1.0, (centre + margin) / denominator) * 100,
+    )
+
+
+def _backtest_stats_from_trades(trades: list[dict]) -> dict:
+    net_results = [
+        float(trade["net_r"])
+        for trade in trades
+        if isinstance(trade, dict) and trade.get("net_r") is not None
+    ]
+    wins = sum(value > 0 for value in net_results)
+    losses = [value for value in net_results if value < 0]
+    interval = _wilson_percentage(wins, len(net_results))
+    return {
+        "trades": len(net_results),
+        "wins": wins,
+        "win_rate_pct": wins / len(net_results) * 100 if net_results else 0.0,
+        "win_rate_95pct_wilson": list(interval) if interval is not None else None,
+        "profit_factor": (
+            sum(value for value in net_results if value > 0) / abs(sum(losses))
+            if losses and abs(sum(losses)) > 0
+            else None
+        ),
+        "average_net_r": sum(net_results) / len(net_results) if net_results else 0.0,
+    }
+
+
+def load_peak_backtest_evidence(config: dict, tier: str) -> dict:
+    """Load live-strategy backtest evidence without treating setup score as probability."""
+    quality_settings = config.get("setup_quality", {})
+    summary_path = Path(
+        quality_settings.get(
+            "backtest_summary_path",
+            "logs/peak_backtest_summary.json",
+        )
+    )
+    trades_path = Path(
+        quality_settings.get(
+            "backtest_trades_path",
+            "logs/peak_backtest_trades.json",
+        )
+    )
+    validation_settings = config.get("backtest", {}).get("validation", {})
+    minimum_trades = max(1, int(validation_settings.get("minimum_trades", 100)))
+
+    summary = None
+    try:
+        loaded = json.loads(summary_path.read_text(encoding="utf-8"))
+        if isinstance(loaded, dict):
+            summary = loaded
+    except (OSError, ValueError, TypeError):
+        pass
+
+    if summary is not None:
+        overall = {
+            "trades": int(summary.get("filled_trades", 0)),
+            "wins": int(summary.get("wins", 0)),
+            "win_rate_pct": float(summary.get("win_rate_pct", 0.0)),
+            "win_rate_95pct_wilson": summary.get("win_rate_95pct_wilson"),
+            "profit_factor": summary.get("profit_factor"),
+            "average_net_r": summary.get("average_net_r"),
+        }
+        by_tier = summary.get("by_tier", {})
+        tier_stats = by_tier.get(tier) if isinstance(by_tier, dict) else None
+        validation = summary.get("validation", {})
+        validation_passed = bool(
+            isinstance(validation, dict) and validation.get("passed", False)
+        )
+        minimum_trades = max(
+            minimum_trades,
+            int(validation.get("minimum_trades", minimum_trades))
+            if isinstance(validation, dict)
+            else minimum_trades,
+        )
+    else:
+        try:
+            loaded_trades = json.loads(trades_path.read_text(encoding="utf-8"))
+            trades = loaded_trades if isinstance(loaded_trades, list) else []
+        except (OSError, ValueError, TypeError):
+            trades = []
+        overall = _backtest_stats_from_trades(trades)
+        tier_stats = _backtest_stats_from_trades(
+            [
+                trade
+                for trade in trades
+                if isinstance(trade, dict) and trade.get("tier") == tier
+            ]
+        )
+        validation_passed = False
+
+    return {
+        "overall": overall,
+        "tier": tier_stats if isinstance(tier_stats, dict) else None,
+        "tier_name": tier,
+        "minimum_trades": minimum_trades,
+        "validation_passed": validation_passed,
+    }
+
+
+def format_peak_backtest_evidence(config: dict, tier: str) -> str:
+    evidence = load_peak_backtest_evidence(config, tier)
+    overall = evidence["overall"]
+    tier_stats = evidence.get("tier")
+    selected = (
+        tier_stats
+        if isinstance(tier_stats, dict) and int(tier_stats.get("trades", 0)) > 0
+        else overall
+    )
+    trades = int(selected.get("trades", 0))
+    if trades <= 0:
+        return (
+            "Tỷ lệ thắng backtest: chưa có lệnh đã fill; điểm setup không phải % thắng."
+        )
+    wins = int(selected.get("wins", 0))
+    win_rate = float(selected.get("win_rate_pct", wins / trades * 100))
+    interval = selected.get("win_rate_95pct_wilson")
+    interval_text = ""
+    if isinstance(interval, (list, tuple)) and len(interval) == 2:
+        interval_text = f" · CI95% {float(interval[0]):.1f}–{float(interval[1]):.1f}%"
+    scope = (
+        f"tier {tier}"
+        if selected is tier_stats
+        else "toàn bộ chiến lược"
+    )
+    total_trades = int(overall.get("trades", 0))
+    minimum_trades = int(evidence["minimum_trades"])
+    if total_trades < minimum_trades:
+        validation_text = f"CHƯA ĐỦ MẪU {total_trades}/{minimum_trades}"
+    elif evidence["validation_passed"]:
+        validation_text = "đã đạt ngưỡng backtest cấu hình"
+    else:
+        validation_text = "chưa đạt profit factor/expectancy yêu cầu"
+    return (
+        f"Tỷ lệ thắng backtest {scope}: {wins}/{trades} = {win_rate:.1f}%"
+        f"{interval_text} · {validation_text}; không dùng như cam kết cho lệnh kế tiếp."
+    )
+
+
 def interval_to_minutes(interval: str) -> int:
     units = {"min": 1, "h": 60, "day": 1440}
     for suffix, multiplier in units.items():
@@ -404,6 +555,7 @@ def format_peak_execution_guide(
     quality: SetupQualityAssessment,
     trap: LiquidityTrapAssessment,
     macro_risk: MacroRiskAssessment,
+    backtest_evidence: str | None = None,
 ) -> str:
     resistance = gate.resistance
     ratio_text = (
@@ -429,6 +581,7 @@ def format_peak_execution_guide(
         "🎯 HƯỚNG DẪN THỰC THI",
         f"• Chất lượng setup: {quality.score}/100 · {quality.tier} · "
         f"{quality.recommendation} (đây không phải xác suất thắng).",
+        *([f"• {backtest_evidence}"] if backtest_evidence else []),
         *(
             ["• PAPER ONLY: strategy live chưa đủ mẫu để xác nhận edge sau phí."]
             if quality.paper_only
@@ -873,6 +1026,9 @@ def format_compact_reply(
     realtime_quote: RealtimeQuote,
     liquidity: PeakLiquidityAssessment | None = None,
     macro_risk: MacroRiskAssessment | None = None,
+    quality: SetupQualityAssessment | None = None,
+    trap: LiquidityTrapAssessment | None = None,
+    backtest_evidence: str | None = None,
 ) -> tuple[str, TradingPlan | None, ScenarioLevels]:
     planning_bias = MomentumBias(
         price=bias.price,
@@ -888,6 +1044,7 @@ def format_compact_reply(
         and retest.invalidation is not None
         and (liquidity is None or liquidity.entries_allowed)
         and (macro_risk is None or not macro_risk.blocked)
+        and (quality is None or quality.actionable)
     ):
         plan = build_trading_plan(
             planning_bias,
@@ -965,8 +1122,17 @@ def format_compact_reply(
     if derivatives_parts:
         fair_value_lines.append(" · ".join(derivatives_parts))
 
+    quality_block_reason = None
+    if quality is not None and not quality.actionable:
+        quality_block_reason = (
+            " | ".join(quality.blockers[:2])
+            if quality.blockers
+            else f"điểm setup {quality.score}/100 chưa đạt ngưỡng"
+        )
     decision_reason = (
-        macro_risk.reason
+        quality_block_reason
+        if quality_block_reason is not None
+        else macro_risk.reason
         if macro_risk is not None and macro_risk.blocked
         else liquidity.reason
         if liquidity is not None and not liquidity.entries_allowed
@@ -982,6 +1148,22 @@ def format_compact_reply(
         if liquidity is not None
         else None
     )
+    quality_lines = []
+    if quality is not None:
+        quality_lines = [
+            f"📐 *MỨC ĐỘ SETUP: {quality.score}/100 · {quality.tier}*",
+            f"• Mức đánh: *{quality.recommendation}* · trần rủi ro "
+            f"{quality.recommended_risk_pct:.2f}% tài khoản.",
+            "• Điểm setup là độ hoàn thiện điều kiện, không phải phần trăm thắng.",
+        ]
+        if backtest_evidence:
+            quality_lines.append(f"• {backtest_evidence}")
+        if trap is not None:
+            quality_lines.append(f"• Sweep/FOMO: {trap.reason}.")
+        if quality.blockers:
+            quality_lines.append(
+                "• Blocker: " + " | ".join(quality.blockers[:3])
+            )
 
     lines = [
         f"📊 *XAUUSDT PERP {bias.price:.2f}* · {feed_status} · {realtime_quote.source}",
@@ -993,6 +1175,7 @@ def format_compact_reply(
             if macro_risk is not None
             else []
         ),
+        *quality_lines,
         f"🧭 *QUYẾT ĐỊNH: {forecast}* — {decision_reason}",
         "",
         "🧱 *VÙNG GIÁ*",
@@ -1037,20 +1220,21 @@ async def handle_signal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         interval = config["live"]["interval"]
         timeframes = config["live"].get("analysis_timeframes", [interval, "1h", "4h"])
         analysis_now = datetime.now(timezone.utc)
-        raw_frames = {
-            timeframe: provider.get_historical(
-                interval=timeframe,
-                outputsize=config["live"]["outputsize"],
-            )
-            for timeframe in timeframes
-        }
+        opportunity = await asyncio.to_thread(
+            compute_peak_opportunity,
+            config,
+            provider,
+            price_stream,
+            analysis_now,
+        )
         frames = {
-            timeframe: select_closed_candles(frame, timeframe, analysis_now)
-            for timeframe, frame in raw_frames.items()
+            timeframe: opportunity.frames[timeframe]
+            for timeframe in timeframes
         }
         df = frames[interval]
         biases = {
-            timeframe: compute_momentum_bias(frame, config["weights"])
+            timeframe: opportunity.momentum_biases.get(timeframe)
+            or compute_momentum_bias(frame, config["weights"])
             for timeframe, frame in frames.items()
         }
         structures = {
@@ -1105,7 +1289,7 @@ async def handle_signal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         recent_signals = set(signal_series["signal"].tail(recent_signal_bars))
         legacy_long_confirmed = "BUY" in recent_signals
         legacy_short_confirmed = "SELL" in recent_signals
-        realtime_quote = get_current_quote(provider, price_stream)
+        realtime_quote = opportunity.realtime_quote
         if realtime_quote.open_interest is None and hasattr(
             provider,
             "get_open_interest",
@@ -1117,18 +1301,8 @@ async def handle_signal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         latest_price = realtime_quote.price
         bias.price = latest_price
         result.price = latest_price
-        liquidity = assess_peak_liquidity(
-            frames["1h"],
-            latest_price,
-            realtime_quote.bid_price,
-            realtime_quote.ask_price,
-            analysis_now=analysis_now,
-            settings=config.get("peak_liquidity", {}),
-        )
-        macro_risk = assess_macro_risk(
-            analysis_now,
-            config.get("macro_guard", {}),
-        )
+        liquidity = opportunity.liquidity
+        macro_risk = opportunity.macro_risk
         resistance_test = analyze_resistance_zone(
             df=df,
             current_price=latest_price,
@@ -1155,6 +1329,10 @@ async def handle_signal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             news_config.get("feeds", []),
             limit=int(news_config.get("max_items", 4)),
         )
+        backtest_evidence = format_peak_backtest_evidence(
+            config,
+            opportunity.quality.tier,
+        )
         reply, plan, scenarios = format_compact_reply(
             bias,
             result,
@@ -1170,6 +1348,9 @@ async def handle_signal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             realtime_quote,
             liquidity,
             macro_risk,
+            opportunity.quality,
+            opportunity.trap,
+            backtest_evidence,
         )
         multi_chart = render_multi_timeframe_chart(
             frames=frames,
@@ -1437,6 +1618,10 @@ async def handle_peaks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             parse_mode="Markdown",
             disable_web_page_preview=True,
         )
+        backtest_evidence = format_peak_backtest_evidence(
+            config,
+            opportunity.quality.tier,
+        )
         execution_guide = format_peak_execution_guide(
             gate,
             execution_plan,
@@ -1450,7 +1635,11 @@ async def handle_peaks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             opportunity.quality,
             opportunity.trap,
             opportunity.macro_risk,
+            backtest_evidence,
         )
+        # Send the deterministic scorecard immediately; AI review may take tens
+        # of seconds or fail independently and must never hide the code result.
+        await update.message.reply_text(execution_guide)
         ai_execution_plan = execution_plan if sized_plan is not None else None
         ai_execution_reason = execution_reason
         if execution_plan is not None and sized_plan is None:
@@ -1546,8 +1735,7 @@ async def handle_peaks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
             if not candidates:
                 await update.message.reply_text(
-                    execution_guide
-                    + "\n\n🤖 AI review đỉnh chưa được cấu hình; kế hoạch code phía trên vẫn dùng được."
+                    "🤖 AI review đỉnh chưa được cấu hình; scorecard code phía trên vẫn dùng được."
                 )
             else:
                 review = None
@@ -1613,9 +1801,7 @@ async def handle_peaks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
                 if review is not None and used_label is not None:
                     await update.message.reply_text(
-                        execution_guide
-                        + "\n\n"
-                        + format_peak_ai_review(
+                        format_peak_ai_review(
                             review,
                             used_label,
                             gate,
@@ -1623,23 +1809,18 @@ async def handle_peaks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                     )
                 elif last_error and is_ai_rate_limit_error(last_error):
                     await update.message.reply_text(
-                        execution_guide
-                        + "\n\n🤖 AI review đỉnh đang bị rate limit; bot không dùng kết quả cũ."
+                        "🤖 AI review đỉnh đang bị rate limit; bot không dùng kết quả cũ."
                     )
                 elif unavailable_reasons:
                     await update.message.reply_text(
-                        execution_guide
-                        + "\n\n🤖 AI review: "
+                        "🤖 AI review: "
                         + "; ".join(unavailable_reasons)
                         + "."
                     )
                 else:
                     await update.message.reply_text(
-                        execution_guide
-                        + "\n\n🤖 AI review đỉnh tạm lỗi; kế hoạch code phía trên vẫn là dữ liệu mới."
+                        "🤖 AI review đỉnh tạm lỗi; scorecard code phía trên vẫn là dữ liệu mới."
                     )
-        else:
-            await update.message.reply_text(execution_guide)
     except Exception:
         logger.exception("Failed to compute peak map")
         await update.message.reply_text(
@@ -1688,19 +1869,21 @@ def _parse_utc(value) -> datetime | None:
 
 MANUAL_POSITION_TEXT_PATTERN = re.compile(
     r"^/?(?P<side>long|short|sort)(?:@\w+)?:\s*"
-    r"(?P<margin>\d+(?:[.,]\d+)?)\s*[_\s-]+\s*"
+    r"(?P<margin>\d+(?:[.,]\d+)?)\s*:\s*"
+    r"(?P<entry>\d+(?:[.,]\d+)?)\s*:\s*"
     r"(?P<leverage>\d+)\s*x?\s*$",
     re.IGNORECASE,
 )
 MANUAL_POSITION_COMMAND_PATTERN = re.compile(
     r"^/(?P<side>long|short|sort)(?:@\w+)?\s+"
     r"(?P<margin>\d+(?:[.,]\d+)?)\s*[_\s-]+\s*"
+    r"(?P<entry>\d+(?:[.,]\d+)?)\s*[_\s-]+\s*"
     r"(?P<leverage>\d+)\s*x?\s*$",
     re.IGNORECASE,
 )
 
 
-def parse_manual_position_command(text: str) -> tuple[str, float, int] | None:
+def parse_manual_position_command(text: str) -> tuple[str, float, float, int] | None:
     """Parse both Telegram-safe commands and the requested colon shorthand."""
     value = (text or "").strip()
     match = MANUAL_POSITION_TEXT_PATTERN.fullmatch(value)
@@ -1711,8 +1894,9 @@ def parse_manual_position_command(text: str) -> tuple[str, float, int] | None:
     side_token = match.group("side").lower()
     side = "LONG" if side_token == "long" else "SHORT"
     margin = float(match.group("margin").replace(",", "."))
+    entry = float(match.group("entry").replace(",", "."))
     leverage = int(match.group("leverage"))
-    return side, margin, leverage
+    return side, margin, entry, leverage
 
 
 def _manual_position_settings(config: dict) -> dict:
@@ -1811,7 +1995,7 @@ def build_manual_position_state(
         "notional_usdt": notional,
         "quantity_xau": quantity,
         "entry_price": entry_price,
-        "entry_tracking_mode": "REFERENCE_QUOTE_NOT_EXCHANGE_FILL",
+        "entry_tracking_mode": "USER_REPORTED_ENTRY_NOT_EXCHANGE_VERIFIED",
         "opened_at": opened_at.isoformat(),
         "risk_distance": stop_distance,
         "stop_loss": stop_loss,
@@ -3402,13 +3586,14 @@ async def handle_manual_position(
     text = update.effective_message.text if update.effective_message else ""
     parsed = parse_manual_position_command(text)
     usage = (
-        "Cú pháp: /long:100_5x hoặc /long 100 5x; "
-        "/short:100_5x (cũng chấp nhận /sort:100_5x)."
+        "Cú pháp: /long:100:3350:5x hoặc /long 100 3350 5x; "
+        "thứ tự là ký quỹ USDT : giá entry : đòn bẩy. "
+        "SHORT dùng /short:100:3350:5x (cũng chấp nhận /sort)."
     )
     if parsed is None:
         await update.effective_message.reply_text(usage)
         return
-    side, margin_usdt, leverage = parsed
+    side, margin_usdt, entry_price, leverage = parsed
     config = context.bot_data["config"]
     settings = _manual_position_settings(config)
     if not settings.get("enabled", True):
@@ -3420,6 +3605,11 @@ async def handle_manual_position(
     if not minimum_margin <= margin_usdt <= maximum_margin:
         await update.effective_message.reply_text(
             f"Số tiền phải từ {minimum_margin:.2f} đến {maximum_margin:.2f} USDT. {usage}"
+        )
+        return
+    if entry_price <= 0:
+        await update.effective_message.reply_text(
+            f"Giá entry phải lớn hơn 0. {usage}"
         )
         return
     if leverage < 1 or leverage > maximum_leverage:
@@ -3439,7 +3629,7 @@ async def handle_manual_position(
             )
             return
         try:
-            _quote, entry_price, atr, checked_at = await asyncio.to_thread(
+            _quote, market_price, atr, checked_at = await asyncio.to_thread(
                 _capture_manual_position_market,
                 config,
                 context.bot_data["provider"],
@@ -3486,7 +3676,8 @@ async def handle_manual_position(
             [
                 f"✅ ĐÃ GHI NHẬN {side} — THEO DÕI THAM CHIẾU",
                 f"• Ký quỹ {margin_usdt:.2f} USDT · {leverage}x · notional {float(position['notional_usdt']):.2f} USDT · {float(position['quantity_xau']):.3f} XAU.",
-                f"• Entry tham chiếu {entry_price:.2f} · ATR15m {atr:.2f}. Đây là quote khi bot nhận lệnh, không xác nhận fill Binance thật.",
+                f"• Entry bạn khai báo {entry_price:.2f} · giá thị trường khi ghi nhận {market_price:.2f} · ATR15m {atr:.2f}.",
+                "• Bot dùng entry bạn nhập để tính PnL/SL/TP; không tự xác nhận giá fill thật trên Binance.",
                 f"• SL {float(position['stop_loss']):.2f} · TP1 {float(position['take_profit_1']):.2f} · TP2 {float(position['take_profit_2']):.2f}.",
                 f"• Nếu chạm SL: lỗ ước tính sau phí/trượt khoảng {float(position['projected_stop_loss_usdt']):.2f} USDT ({float(position['projected_stop_roe_pct']):.2f}% ký quỹ).",
                 f"• Bot kiểm tra mỗi {int(settings.get('poll_seconds', 10))} giây. Khi cần đóng, cảnh báo lặp đến khi bạn gửi /dong.",
@@ -3508,7 +3699,7 @@ async def handle_manual_position_status(
         position = _get_manual_position(context, settings)
         if position is None:
             await update.effective_message.reply_text(
-                "Không có vị thế thủ công đang theo dõi. Dùng /long:100_5x hoặc /short:100_5x."
+                "Không có vị thế thủ công đang theo dõi. Dùng /long:100:3350:5x hoặc /short:100:3350:5x."
             )
             return
         checked_at = datetime.now(timezone.utc)
@@ -3578,7 +3769,7 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "Bot phân tích Binance Futures XAUUSDT.\n"
         "• /gia hoặc /signal: kịch bản giao dịch đã xác nhận.\n"
         "• /dinh: bản đồ đỉnh cũ/mới, cản trên và hỗ trợ retest.\n"
-        "• /long:100_5x hoặc /short:100_5x: theo dõi vị thế thủ công mỗi 10 giây.\n"
+        "• /long:100:3350:5x hoặc /short:100:3350:5x: ký quỹ 100 USDT, entry 3350, đòn bẩy 5x; theo dõi mỗi 10 giây.\n"
         "• /vithe: xem PnL; /dong: dừng theo dõi thủ công.\n"
         "• /canh: trạng thái canh tự động; /canhbat hoặc /canhtat để điều khiển."
     )
