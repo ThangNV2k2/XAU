@@ -130,7 +130,20 @@ python main.py             # chạy thật, đẩy tin khi tín hiệu đổi tr
 - `manual_position` — monitor một vị thế do người dùng khai báo: chu kỳ 10 giây, ATR/SL/TP, khoảng lặp cảnh báo, giới hạn dữ liệu ký quỹ/đòn bẩy và file trạng thái để tiếp tục sau khi bot restart.
 - `auto_alerts` — quét cấu trúc nền mỗi 30 giây; khi có setup LONG/SHORT bot gửi cảnh báo code ngay, gọi AI ở tác vụ riêng để gửi thông báo xác thực thứ hai, rồi canh giá mỗi 10 giây. Nến 1m cập nhật mỗi phút; vòng canh nhanh không gọi AI.
 
-## 6. Cấu trúc project
+## 6. Log khi chạy Docker
+
+- `docker logs` dùng driver `local`, mặc định trong [build.txt](build.txt) giữ 5 file × 50 MB và nén file cũ.
+- `logs/telegram_query_bot.log` là log ứng dụng tồn tại qua lần `docker rm/recreate` nhờ bind mount. Mặc định xoay 10 bản × 25 MB; đổi bằng `BOT_LOG_MAX_MB` và `BOT_LOG_BACKUP_COUNT` trong `.env`.
+- `logs/diagnostics/analysis-*.jsonl` lưu snapshot quyết định, sự kiện auto/manual position và lý do bot cảnh báo hoặc đứng ngoài. Cấu hình hiện giữ 365 ngày, mỗi part tối đa 50 MB.
+
+```bash
+sudo docker logs -f --timestamps --tail 1000 xau-signal
+tail -F logs/telegram_query_bot.log
+du -sh logs
+find logs/diagnostics -type f -name 'analysis-*.jsonl' | sort | tail
+```
+
+## 7. Cấu trúc project
 
 ```
 data_provider/          # Binance Futures cho live; Twelve Data chỉ cho backtest tham chiếu

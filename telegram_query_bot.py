@@ -6,6 +6,7 @@ import os
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 import yaml
@@ -89,10 +90,20 @@ from macro_risk import MacroRiskAssessment, assess_macro_risk
 load_dotenv()
 
 os.makedirs("logs", exist_ok=True)
+BOT_LOG_MAX_MB = max(1, int(os.getenv("BOT_LOG_MAX_MB", "25")))
+BOT_LOG_BACKUP_COUNT = max(1, int(os.getenv("BOT_LOG_BACKUP_COUNT", "10")))
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler()],
+    handlers=[
+        logging.StreamHandler(),
+        RotatingFileHandler(
+            "logs/telegram_query_bot.log",
+            maxBytes=BOT_LOG_MAX_MB * 1024 * 1024,
+            backupCount=BOT_LOG_BACKUP_COUNT,
+            encoding="utf-8",
+        ),
+    ],
 )
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("apscheduler").setLevel(logging.WARNING)

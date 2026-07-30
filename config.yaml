@@ -202,7 +202,7 @@ analysis_diagnostics:
   enabled: true
   directory: "logs/diagnostics"
   retention_days: 365
-  max_file_mb: 10
+  max_file_mb: 50
   recent_closed_candles:
     15min: 8
     1h: 6
