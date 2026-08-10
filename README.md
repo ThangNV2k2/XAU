@@ -66,6 +66,21 @@ Một tiến trình `telegram_query_bot.py` vừa trả lời lệnh, vừa tự
    - Cùng một setup được chống gửi lặp; có thể báo hai giai đoạn `SÁT ENTRY` và `ĐÃ VÀO ENTRY`.
    - Cảnh báo định lượng được gửi trước; nếu `auto_alerts.ai_review_after_alert` bật, bot gọi AI ở tác vụ riêng và có dùng quota. Vòng canh giá nhanh sau đó không gọi AI.
    - Mặc định cảnh báo ghi rõ `PAPER ONLY`, mô phỏng chạm Entry/SL/TP và hướng dẫn ghi journal; không hướng dẫn đặt lệnh thật cho đến khi người vận hành chủ động tắt paper mode sau kiểm định.
+   - Bot đồng thời chạy bộ canh **breakout–retest M5 vàng thế giới XAU/USD spot từ Twelve Data**, chỉ từ **20:35 đến trước 24:00 giờ Việt Nam**. Nến mốc luôn là nến **20:30–20:35** đã đóng; tác vụ chạy mỗi 5 phút và căn ngay sau các mốc đóng nến `:00/:05/:10/...`.
+   - Sau một nến M5 spot đóng vượt High hoặc thủng Low, bot bắt buộc chờ một nến M5 sau đó quay lại vùng vừa phá, đóng đúng phía và có vị trí đóng cửa xác nhận từ chối. Khi đủ điều kiện, Telegram nhận ngay giá spot tham chiếu, SL ngoài nến retest, TP1 1.5R và TP2 2R.
+   - `/m5` — xem High/Low của nến mốc, hướng breakout và trạng thái chờ retest hiện tại. Mỗi phiên chỉ push một tín hiệu M5 và trạng thái gửi được lưu qua lần khởi động lại.
+
+### Kết nối nguồn vàng thế giới cho M5
+
+Nguồn M5 dùng `XAU/USD` spot từ Twelve Data. API hỗ trợ trực tiếp nến `5min`; không cần tài khoản Exness, terminal MT5 hay Windows VPS. Tạo API key Twelve Data và không commit key lên Git.
+
+Điền vào `.env`:
+
+```dotenv
+TWELVEDATA_API_KEY=your_api_key
+```
+
+Sau khi restart bot, gửi `/m5` để xác nhận dòng `Nguồn giá: Twelve Data XAU/USD spot`. Entry/SL/TP trong cảnh báo là mốc theo nguồn spot thế giới; nếu giao dịch ở broker khác, phải đối chiếu chênh lệch giá và spread trước khi đặt lệnh.
 6. Trong Telegram, nhắn `/signal` hoặc `/gia` cho bot → nhận ngay:
    - Giá bid/ask realtime từ Binance WebSocket; Last, Mark, Index, funding và open interest từ public Futures API.
    - Entry/vùng giá dựa trên nến giao dịch XAUUSDT; Mark Price dùng để theo dõi rủi ro PnL chưa thực hiện/thanh lý; Index và basis dùng để phát hiện lệch giá.
@@ -139,6 +154,7 @@ python main.py             # chạy thật, đẩy tin khi tín hiệu đổi tr
 - `backtest.validation` — số lệnh, profit factor và expectancy tối thiểu để báo đã đủ điều kiện kiểm định; không tự tắt `paper_only`.
 - `manual_position` — monitor một vị thế do người dùng khai báo: chu kỳ 10 giây, ATR/SL/TP, khoảng lặp cảnh báo, giới hạn dữ liệu ký quỹ/đòn bẩy và file trạng thái để tiếp tục sau khi bot restart.
 - `auto_alerts` — quét cấu trúc nền mỗi 30 giây; khi có setup LONG/SHORT bot gửi cảnh báo code ngay, gọi AI ở tác vụ riêng để gửi thông báo xác thực thứ hai, rồi canh giá mỗi 10 giây. Nến 1m cập nhật mỗi phút; vòng canh nhanh không gọi AI.
+- `opening_range_m5` — bộ canh XAU/USD spot thế giới riêng cho nến 20:30–20:35 giờ Việt Nam: nguồn/symbol, chu kỳ M5, độ rộng vùng retest, vị trí đóng cửa tối thiểu của nến từ chối, đệm SL, thời hạn tối đa để push tín hiệu mới và các mức TP 1.5R/2R. Bộ canh này không gọi AI và không hoạt động ngoài 20:35–24:00.
 
 ## 6. Log khi chạy Docker
 

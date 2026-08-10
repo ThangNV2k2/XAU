@@ -199,6 +199,26 @@ auto_alerts:
   send_hourly_chart: true
   state_path: "logs/auto_alert_state.json"
 
+# Chiến lược riêng cho biên nến M5 đầu phiên tối (giờ Việt Nam).
+# Nến mốc luôn là 20:30–20:35; bot chỉ quét và phát tín hiệu từ 20:35 đến trước 24:00.
+opening_range_m5:
+  enabled: true
+  notify_on_start: true
+  data_provider: "twelvedata"
+  symbol: "XAU/USD"
+  poll_seconds: 300
+  close_settle_seconds: 10
+  outputsize: 100
+  state_path: "logs/opening_range_m5_world_spot_state.json"
+  signal_max_age_seconds: 90
+  breakout_buffer_price: 0.0
+  retest_tolerance_price: 0.50
+  minimum_rejection_close_location: 0.65
+  stop_buffer_price: 0.20
+  price_tick: 0.01
+  take_profit_1_r: 1.5
+  take_profit_2_r: 2.0
+
 # Dataset de xem lai vi sao bot bao/khong bao. Moi snapshot la JSON tren mot dong.
 analysis_diagnostics:
   enabled: true

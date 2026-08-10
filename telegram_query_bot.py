@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
+import pandas as pd
 import yaml
 from dotenv import load_dotenv
 from telegram import Update
@@ -27,6 +28,7 @@ from analysis_diagnostics import (
 )
 
 from data_provider.binance_futures_provider import BinanceFuturesProvider
+from data_provider.twelvedata_provider import TwelveDataProvider
 from indicators.signal_engine import (
     MomentumBias,
     SignalResult,
@@ -86,6 +88,15 @@ from peak_analysis import (
     render_peak_confirmation_chart,
 )
 from macro_risk import MacroRiskAssessment, assess_macro_risk
+from opening_range_m5 import (
+    VIETNAM_TZ,
+    M5TradePlan,
+    OpeningRangeM5Assessment,
+    assess_opening_range_m5,
+    build_m5_trade_plan,
+    is_monitoring_time,
+    seconds_until_next_m5_check,
+)
 
 load_dotenv()
 
@@ -3901,6 +3912,281 @@ async def manual_position_monitor_job(context: ContextTypes.DEFAULT_TYPE) -> Non
             logger.exception("Manual position monitor check failed")
 
 
+def _format_vn_m5_candle(candle_start: datetime | None) -> str:
+    if candle_start is None:
+        return "chưa có"
+    local_start = candle_start.astimezone(VIETNAM_TZ)
+    local_end = local_start + timedelta(minutes=5)
+    return f"{local_start:%H:%M}–{local_end:%H:%M}"
+
+
+def format_opening_range_m5_status(
+    assessment: OpeningRangeM5Assessment,
+    symbol: str = "XAU/USD",
+    data_source: str = "Twelve Data world spot",
+) -> str:
+    lines = [
+        f"🕯 CANH BREAKOUT–RETEST M5 {symbol}",
+        f"• Nguồn giá: {data_source}.",
+        f"• Phiên {assessment.window.session_date:%d/%m/%Y}: 20:35–24:00 giờ Việt Nam.",
+        f"• Trạng thái: {assessment.status} — {assessment.reason}",
+    ]
+    if assessment.opening_high is not None and assessment.opening_low is not None:
+        lines.append(
+            f"• Nến mốc 20:30–20:35: High {assessment.opening_high:.2f} · "
+            f"Low {assessment.opening_low:.2f}."
+        )
+    if assessment.breakout_side is not None:
+        lines.append(
+            f"• Breakout {assessment.breakout_side}: nến "
+            f"{_format_vn_m5_candle(assessment.breakout_candle_start)} đóng "
+            f"{assessment.breakout_close:.2f}."
+        )
+    if assessment.confirmation_candle_start is not None:
+        lines.append(
+            f"• Retest xác nhận: nến "
+            f"{_format_vn_m5_candle(assessment.confirmation_candle_start)} đóng "
+            f"{assessment.confirmation_close:.2f}."
+        )
+    return "\n".join(lines)
+
+
+def format_opening_range_m5_alert(
+    assessment: OpeningRangeM5Assessment,
+    plan: M5TradePlan,
+    entry_source: str,
+    symbol: str = "XAU/USD",
+) -> str:
+    return "\n".join(
+        [
+            f"🚨 M5 BREAKOUT–RETEST {symbol} — {plan.side}",
+            f"• Phiên Việt Nam {assessment.window.session_date:%d/%m/%Y}, chỉ canh 20:35–24:00.",
+            f"• Biên nến 20:30–20:35: High {assessment.opening_high:.2f} · Low {assessment.opening_low:.2f}.",
+            f"• Breakout: nến {_format_vn_m5_candle(assessment.breakout_candle_start)} đóng {assessment.breakout_close:.2f}.",
+            f"• Retest xác nhận: nến {_format_vn_m5_candle(assessment.confirmation_candle_start)} đóng {assessment.confirmation_close:.2f}.",
+            "",
+            f"▶️ GIÁ VÀO THAM CHIẾU NGAY: {plan.entry:.2f} ({entry_source} lúc gửi tin)",
+            f"🛑 CẮT LỖ: {plan.stop_loss:.2f} · rủi ro giá {plan.risk:.2f} = 1R",
+            f"✅ CHỐT LỜI 1: {plan.take_profit_1:.2f} ({plan.reward_risk_1:g}R)",
+            f"✅ CHỐT LỜI 2: {plan.take_profit_2:.2f} ({plan.reward_risk_2:g}R)",
+            "",
+            "Bot không tự đặt lệnh. Hãy kiểm tra giá khớp thực tế; nếu khác giá trên, phải tính lại TP theo khoảng cách từ giá khớp đến SL.",
+        ]
+    )
+
+
+async def opening_range_m5_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings = context.bot_data["config"].get("opening_range_m5", {})
+    if not settings.get("enabled", True):
+        return
+    checked_at = datetime.now(timezone.utc)
+    if not is_monitoring_time(checked_at):
+        return
+    m5_provider = context.bot_data.get("opening_range_m5_provider")
+    if m5_provider is None:
+        context.bot_data["opening_range_m5_last_error"] = context.bot_data.get(
+            "opening_range_m5_provider_error",
+            "Nguồn dữ liệu M5 chưa được khởi tạo.",
+        )
+        return
+
+    lock = context.bot_data.setdefault("opening_range_m5_lock", asyncio.Lock())
+    if lock.locked():
+        return
+    async with lock:
+        context.bot_data["opening_range_m5_last_check"] = checked_at
+        try:
+            frame = await asyncio.to_thread(
+                m5_provider.get_historical,
+                interval="5min",
+                outputsize=max(20, min(1500, int(settings.get("outputsize", 100)))),
+            )
+            assessment = assess_opening_range_m5(frame, checked_at, settings)
+            context.bot_data["opening_range_m5_last_assessment"] = assessment
+            context.bot_data["opening_range_m5_last_error"] = None
+            if assessment.status != "SIGNAL":
+                return
+
+            confirmation_closed_at = assessment.confirmation_closed_at
+            if confirmation_closed_at is None:
+                return
+            signal_age = (checked_at - confirmation_closed_at).total_seconds()
+            maximum_age = max(
+                10,
+                int(settings.get("signal_max_age_seconds", 90)),
+            )
+            if signal_age < 0 or signal_age > maximum_age:
+                context.bot_data["opening_range_m5_last_skip_reason"] = (
+                    f"Tín hiệu đã cũ {max(0, int(signal_age))} giây; không gửi đuổi giá."
+                )
+                return
+
+            state_path = settings.get(
+                "state_path",
+                "logs/opening_range_m5_world_spot_state.json",
+            )
+            state = _load_auto_alert_state(state_path)
+            sent_sessions = state.get("sent_sessions", {})
+            if not isinstance(sent_sessions, dict):
+                sent_sessions = {}
+            session_key = assessment.window.session_date.isoformat()
+            if session_key in sent_sessions:
+                return
+
+            m5_source = str(settings.get("data_provider", "twelvedata")).lower()
+            if m5_source == "twelvedata":
+                quote = {}
+                quote_price = float(
+                    await asyncio.to_thread(m5_provider.get_latest_price)
+                )
+            else:
+                quote = await asyncio.to_thread(m5_provider.get_quote)
+                quote_price = float(quote["close"])
+            quote_source = str(
+                quote.get("source")
+                or context.bot_data.get(
+                    "opening_range_m5_source_label",
+                    "Twelve Data XAU/USD spot",
+                )
+            )
+            if assessment.breakout_side == "LONG":
+                executable_price = float(quote.get("ask") or quote_price)
+                entry_source = (
+                    f"{quote_source} Ask" if quote.get("ask") is not None else quote_source
+                )
+            else:
+                executable_price = float(quote.get("bid") or quote_price)
+                entry_source = (
+                    f"{quote_source} Bid" if quote.get("bid") is not None else quote_source
+                )
+            plan = build_m5_trade_plan(assessment, executable_price, settings)
+            await context.bot.send_message(
+                chat_id=context.bot_data["authorized_chat_id"],
+                text=format_opening_range_m5_alert(
+                    assessment,
+                    plan,
+                    entry_source,
+                    str(context.bot_data.get("opening_range_m5_symbol", "XAU/USD")),
+                ),
+            )
+
+            cutoff = assessment.window.session_date - timedelta(days=30)
+            retained_sessions = {
+                key: value
+                for key, value in sent_sessions.items()
+                if key >= cutoff.isoformat()
+            }
+            retained_sessions[session_key] = {
+                "sent_at": checked_at.isoformat(),
+                "side": plan.side,
+                "entry": plan.entry,
+                "stop_loss": plan.stop_loss,
+                "take_profit_1": plan.take_profit_1,
+                "take_profit_2": plan.take_profit_2,
+            }
+            state["sent_sessions"] = retained_sessions
+            state["last_alert"] = retained_sessions[session_key]
+            _save_auto_alert_state(state_path, state)
+            context.bot_data["opening_range_m5_last_sent"] = checked_at
+            context.bot_data["opening_range_m5_last_plan"] = plan
+            context.bot_data["opening_range_m5_last_skip_reason"] = None
+            logger.info(
+                "Opening-range M5 alert sent: session=%s side=%s entry=%.2f",
+                session_key,
+                plan.side,
+                plan.entry,
+            )
+        except Exception as exc:
+            context.bot_data["opening_range_m5_last_error"] = (
+                f"{type(exc).__name__}: {exc}"
+            )
+            logger.exception("Opening-range M5 check failed")
+
+
+async def handle_opening_range_m5_status(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    settings = context.bot_data["config"].get("opening_range_m5", {})
+    checked_at = datetime.now(timezone.utc)
+    m5_provider = context.bot_data.get("opening_range_m5_provider")
+    if m5_provider is None:
+        error = context.bot_data.get(
+            "opening_range_m5_provider_error",
+            "Nguồn dữ liệu M5 chưa được khởi tạo.",
+        )
+        await update.effective_message.reply_text(
+            "❌ M5 VÀNG THẾ GIỚI CHƯA KẾT NỐI\n"
+            f"• {error}\n"
+            "• Cần TWELVEDATA_API_KEY hợp lệ trong .env."
+        )
+        return
+    try:
+        if is_monitoring_time(checked_at):
+            frame = await asyncio.to_thread(
+                m5_provider.get_historical,
+                interval="5min",
+                outputsize=max(20, min(1500, int(settings.get("outputsize", 100)))),
+            )
+        else:
+            frame = pd.DataFrame()
+        assessment = assess_opening_range_m5(frame, checked_at, settings)
+        context.bot_data["opening_range_m5_last_assessment"] = assessment
+        message = format_opening_range_m5_status(
+            assessment,
+            str(context.bot_data.get("opening_range_m5_symbol", "XAU/USD")),
+            str(
+                context.bot_data.get(
+                    "opening_range_m5_source_label",
+                    "Twelve Data XAU/USD spot",
+                )
+            ),
+        )
+        last_error = context.bot_data.get("opening_range_m5_last_error")
+        last_skip = context.bot_data.get("opening_range_m5_last_skip_reason")
+        if last_skip:
+            message += f"\n• Lần bỏ qua gần nhất: {last_skip}"
+        if last_error:
+            message += f"\n• Lỗi nền gần nhất: {last_error}"
+        await update.effective_message.reply_text(message)
+    except Exception as exc:
+        logger.exception("Failed to report opening-range M5 status")
+        await update.effective_message.reply_text(
+            f"Không lấy được trạng thái M5: {type(exc).__name__}: {exc}"
+        )
+
+
+async def opening_range_m5_startup_job(
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    settings = context.bot_data["config"].get("opening_range_m5", {})
+    if not settings.get("enabled", True) or not settings.get("notify_on_start", True):
+        return
+    if not is_monitoring_time(datetime.now(timezone.utc)):
+        return
+    provider_error = context.bot_data.get("opening_range_m5_provider_error")
+    if provider_error:
+        await context.bot.send_message(
+            chat_id=context.bot_data["authorized_chat_id"],
+            text=(
+                "❌ CANH M5 VÀNG THẾ GIỚI CHƯA KẾT NỐI\n"
+                f"• {provider_error}\n"
+                "• Điền TWELVEDATA_API_KEY rồi dùng /m5 để kiểm tra lại."
+            ),
+        )
+        return
+    await context.bot.send_message(
+        chat_id=context.bot_data["authorized_chat_id"],
+        text=(
+            "✅ CANH M5 20:35–24:00 ĐÃ BẬT\n"
+            f"• Nguồn: {context.bot_data.get('opening_range_m5_source_label', 'Twelve Data world spot')} · {context.bot_data.get('opening_range_m5_symbol', 'XAU/USD')}.\n"
+            "• Mỗi ngày khóa đúng nến 20:30–20:35 giờ Việt Nam.\n"
+            "• Chỉ push sau khi nến đóng breakout, rồi một nến M5 sau retest xác nhận.\n"
+            f"• Kiểm tra mỗi {int(settings.get('poll_seconds', 300)) // 60} phút, căn theo lúc nến M5 đóng; dùng /m5 để xem trạng thái."
+        ),
+    )
+
+
 async def manual_position_startup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     settings = _manual_position_settings(context.bot_data["config"])
     position = _get_manual_position(context, settings)
@@ -4016,6 +4302,7 @@ def command_help_text(config: dict) -> str:
             "• /canh — xem bot đang bật/tắt, lần quét, gate và lỗi gần nhất.",
             "• /canhbat — bật canh tự động.",
             "• /canhtat — tắt canh tự động.",
+            "• /m5 — xem biên nến 20:30–20:35 và trạng thái breakout/retest M5 của phiên tối.",
             "",
             "TRỢ GIÚP",
             "• /h hoặc /help — hiện lại danh sách này.",
@@ -4358,11 +4645,46 @@ def main() -> None:
     )
     price_stream.start()
 
+    m5_settings = config.get("opening_range_m5", {})
+    m5_provider = None
+    m5_provider_error = None
+    m5_symbol = str(m5_settings.get("symbol", "XAU/USD")).strip()
+    m5_source_label = "Twelve Data XAU/USD spot"
+    if m5_settings.get("enabled", True):
+        m5_source = str(m5_settings.get("data_provider", "twelvedata")).lower()
+        if m5_source == "twelvedata":
+            try:
+                api_key = os.getenv("TWELVEDATA_API_KEY", "").strip()
+                if not api_key:
+                    raise RuntimeError("Thiếu TWELVEDATA_API_KEY")
+                m5_provider = TwelveDataProvider(
+                    symbol=m5_symbol,
+                    api_key=api_key,
+                )
+                logger.info(
+                    "Twelve Data world-spot source configured for M5 symbol=%s",
+                    m5_symbol,
+                )
+            except Exception as exc:
+                m5_provider = None
+                m5_provider_error = f"{type(exc).__name__}: {exc}"
+                logger.error("World-spot M5 source unavailable: %s", m5_provider_error)
+        elif m5_source == "binance_futures":
+            m5_provider = provider
+            m5_symbol = provider.symbol
+            m5_source_label = "Binance Futures"
+        else:
+            m5_provider_error = f"Nguồn M5 không hỗ trợ: {m5_source}"
+
     app = Application.builder().token(token).build()
     app.bot_data["config"] = config
     app.bot_data["provider"] = provider
     app.bot_data["price_stream"] = price_stream
     app.bot_data["authorized_chat_id"] = authorized_chat_id
+    app.bot_data["opening_range_m5_provider"] = m5_provider
+    app.bot_data["opening_range_m5_provider_error"] = m5_provider_error
+    app.bot_data["opening_range_m5_symbol"] = m5_symbol
+    app.bot_data["opening_range_m5_source_label"] = m5_source_label
 
     chat_filter = filters.Chat(chat_id=authorized_chat_id)
     app.add_handler(CommandHandler("start", handle_start, filters=chat_filter))
@@ -4372,6 +4694,9 @@ def main() -> None:
     app.add_handler(CommandHandler("canh", handle_auto_status, filters=chat_filter))
     app.add_handler(CommandHandler("canhbat", handle_auto_on, filters=chat_filter))
     app.add_handler(CommandHandler("canhtat", handle_auto_off, filters=chat_filter))
+    app.add_handler(
+        CommandHandler("m5", handle_opening_range_m5_status, filters=chat_filter)
+    )
     app.add_handler(
         CommandHandler(
             ["vo_long", "vo_short", "vo_sort"],
@@ -4431,6 +4756,25 @@ def main() -> None:
                 name="xauusdt-auto-monitor-started",
             )
 
+    if m5_settings.get("enabled", True):
+        m5_poll_seconds = max(300, int(m5_settings.get("poll_seconds", 300)))
+        m5_first_check = seconds_until_next_m5_check(
+            datetime.now(timezone.utc),
+            int(m5_settings.get("close_settle_seconds", 2)),
+        )
+        app.job_queue.run_repeating(
+            opening_range_m5_job,
+            interval=m5_poll_seconds,
+            first=m5_first_check,
+            name="xauusd-world-spot-opening-range-m5",
+        )
+        if m5_settings.get("notify_on_start", True):
+            app.job_queue.run_once(
+                opening_range_m5_startup_job,
+                when=5,
+                name="xauusd-world-spot-opening-range-m5-started",
+            )
+
     manual_settings = _manual_position_settings(config)
     if manual_settings.get("enabled", True):
         manual_poll_seconds = max(
@@ -4450,17 +4794,23 @@ def main() -> None:
         )
 
     logger.info(
-        "Telegram query bot started for chat_id=%s; auto alerts=%s interval=%ss active=%ss manual=%ss",
+        "Telegram query bot started for chat_id=%s; auto alerts=%s interval=%ss active=%ss m5=%s m5_interval=%ss manual=%ss",
         authorized_chat_id,
         auto_settings.get("enabled", True),
         int(auto_settings.get("poll_seconds", 30)),
         int(auto_settings.get("active_poll_seconds", 10)),
+        m5_settings.get("enabled", True),
+        int(m5_settings.get("poll_seconds", 300)),
         int(manual_settings.get("poll_seconds", 10)),
     )
     try:
         app.run_polling()
     finally:
         price_stream.stop()
+        if m5_provider is not None and m5_provider is not provider:
+            shutdown = getattr(m5_provider, "shutdown", None)
+            if callable(shutdown):
+                shutdown()
 
 
 if __name__ == "__main__":

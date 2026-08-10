@@ -70,4 +70,10 @@ class TwelveDataProvider(DataProvider):
 
     def get_quote(self) -> dict:
         """Return the latest quote together with provider timestamps and market state."""
-        return self._request("quote", {"symbol": self.symbol})
+        quote = self._request("quote", {"symbol": self.symbol})
+        normalized = dict(quote)
+        normalized["symbol"] = str(quote.get("symbol") or self.symbol)
+        normalized["close"] = float(quote["close"])
+        normalized["last_quote_at"] = int(quote.get("timestamp") or 0)
+        normalized["source"] = "Twelve Data XAU/USD spot"
+        return normalized
