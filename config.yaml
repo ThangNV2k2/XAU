@@ -1,273 +1,101 @@
-symbol: "XAUUSDT"
+# Nguồn giá duy nhất: terminal Exness MetaTrader 5 đang đăng nhập.
+exness:
+  # Để trống nếu MetaTrader5 tự tìm thấy terminal; nếu có nhiều terminal, điền
+  # đường dẫn terminal64.exe của Exness tại đây hoặc EXNESS_MT5_PATH trong .env.
+  terminal_path: ""
+  timeout_ms: 15000
+  portable: false
+  # Hard-fail nếu terminal đang đăng nhập broker khác, tránh trộn nguồn dữ liệu.
+  require_exness_server: true
 
-market_data:
-  provider: "binance_futures"
-  base_url: "https://fapi.binance.com"
-  websocket_base_url: "wss://fstream.binance.com"
+# Danh sách nhỏ, chỉ gồm vàng và cổ phiếu Mỹ thanh khoản/vốn hóa lớn.
+# Nếu tài khoản Exness không có một mã, bot báo một lần rồi tự bỏ qua mã đó.
+assets:
+  # mode hiện bị khóa ở signal_only: chỉ phân tích/gửi Telegram, không gửi lệnh MT5.
+  - {symbol: XAUUSD, name: Gold, type: metal, mode: signal_only, scan_minutes: 1, enabled: true}
+  - {symbol: AAPL, name: Apple, type: stock, mode: signal_only, scan_minutes: 5, enabled: true}
+  - {symbol: NVDA, name: NVIDIA, type: stock, mode: signal_only, scan_minutes: 5, enabled: true}
+  - {symbol: MSFT, name: Microsoft, type: stock, mode: signal_only, scan_minutes: 5, enabled: true}
+  - {symbol: AMZN, name: Amazon, type: stock, mode: signal_only, scan_minutes: 5, enabled: true}
+  - {symbol: GOOGL, name: Alphabet, type: stock, mode: signal_only, scan_minutes: 5, enabled: true}
+  - {symbol: META, name: Meta, type: stock, mode: signal_only, scan_minutes: 5, enabled: true}
+  - {symbol: TSLA, name: Tesla, type: stock, mode: signal_only, scan_minutes: 5, enabled: true}
+  - {symbol: AVGO, name: Broadcom, type: stock, mode: signal_only, scan_minutes: 5, enabled: true}
+  - {symbol: JPM, name: JPMorgan, type: stock, mode: signal_only, scan_minutes: 5, enabled: true}
+  - {symbol: WMT, name: Walmart, type: stock, mode: signal_only, scan_minutes: 5, enabled: true}
+  - {symbol: FTNT, name: Fortinet, type: stock, mode: signal_only, scan_minutes: 5, enabled: true}
 
-# Diem moi indicator: +1 bullish, -1 bearish, 0 neutral.
-# weighted_score = sum(indicator_score * weight)
-weights:
-  rsi: 1.0
-  macd: 1.2
-  ema_crossover: 1.0
-  bollinger: 0.8
+scanner:
+  # Chỉ lấy lại khung vừa đến hạn; các khung còn lại dùng cache nến đóng.
+  timeframes: [1min, 5min, 15min, 1h, 4h, 1day]
+  # >=800 nến là bắt buộc để EMA200 hội tụ; ở 260 nến thì ~7.4% giá trị EMA200
+  # vẫn là nến seed đầu tiên, làm live lệch backtest và đảo dấu close-vs-EMA200.
+  bars_per_timeframe: 1000
+  close_settle_seconds: 8
 
-threshold_buy: 2.0
-threshold_sell: -2.0
+strategy:
+  # 15m thay vi 5m: o 5m spread an 3.47% risk moi lenh (SL toi thieu chi 3.23$),
+  # 15m con 1.90%. Do tren 15 thang tick that: 5m -23.25R / 15m +23.76R.
+  entry_interval: 15min
 
-# ATR dung de goi y khoang cach stop-loss, khong tinh vao weighted_score
-atr_stop_multiplier: 1.5
-
-# Ke hoach quan tri von (chi tham khao, bot khong tu dat lenh).
-# Sua account_balance_usdt theo so du futures kha dung thuc te.
-trading_plan:
-  account_balance_usdt: 1000
-  risk_per_trade_pct: 0.5
-  max_leverage: 5
-  max_margin_pct: 25
-  price_tick: 0.01
-  quantity_step: 0.001
-  minimum_quantity: 0.001
-  minimum_notional_usdt: 5
-  minimum_bias: 0.25
-  # Uoc tinh theo notional, bao thu hon buffer % khoang SL cu. Can doi chieu fee tier tai khoan.
-  estimated_round_trip_fee_pct: 0.10
-  estimated_slippage_bps: 2.0
-  take_profit_1_r: 1.0
-  take_profit_2_r: 2.0
-  moderate_bias_holding_bars: 8
-  strong_bias_holding_bars: 16
-  allow_overnight: false
-
-live:
-  interval: "15min"   # khung nen dung khi poll gia live
-  poll_minutes: 15    # tan suat poll (phut)
-  outputsize: 100      # so nen lay ve moi lan (du warmup cho cac indicator)
-  analysis_timeframes: ["15min", "1h", "4h"]
-  pressure_interval: "1min"
-  pressure_bars: 30
-
-signal_confirmation:
-  actionable_threshold: 0.40
-  minimum_timeframe_score: 0.12
-  require_all_timeframes: true
+  # Thien huong khung ngay la bo loc CUNG, khong phai mot so hang co trong so.
+  # Bot da mo 150 lenh SHORT trong song tang 70% va lo 34.75R vi thieu no.
+  # NEUTRAL cung chan lenh: khung ngay chua nga ngu thi khong vao.
+  bias_interval: 1day
+  bias_fallback_interval: 4h
+  require_bias_alignment: true
+  # RSI có trọng số lớn nhất nhưng phải đồng thuận EMA/MACD/ADX đa khung.
+  intraday_weights:
+    1min: 0.05
+    5min: 0.20
+    15min: 0.30
+    1h: 0.30
+    4h: 0.15
+  long_term_weights:
+    1h: 0.20
+    4h: 0.50
+    1day: 0.30
+  # DA THU siet len 0.40/0.20. Trong mau thi rat dep (PF 2.02) nhung ra ngoai
+  # mau sup con PF 1.015 (+0.50R tren 55 lenh) — dau hieu overfit dien hinh.
+  # Giu 0.30/0.08: walk-forward cho PF 1.189 (trong mau) -> 1.105 (ngoai mau),
+  # suy giam nhe va van duong o ca hai nua. Dung siet lai neu khong co bang
+  # chung ngoai mau moi.
+  actionable_score: 0.30
+  alignment_floor: 0.08
+  # Không mua khi RSI đã quá nóng và không short khi RSI đã quá bán.
+  rsi_long_zone: [45, 68]
+  rsi_short_zone: [32, 55]
   retest_lookback_bars: 8
-  retest_tolerance_atr: 0.15
-  recent_backtest_bars: 8
-
-peak_map:
-  timeframes: ["15min", "1h", "4h", "1day"]
-  outputsize: 200
-  # Them lich su cho baseline volume theo gio va swing lon; moi request van duoi limit 1500 cua Binance.
-  outputsize_by_timeframe:
-    15min: 500
-    1h: 1000
-    4h: 600
-    1day: 300
-  fractal_span: 2
-  # ZigZag chỉ cộng điểm cho swing đã đảo chiều đủ xa; khung lớn dùng ngưỡng lớn hơn.
-  zigzag_reversal_pct:
-    15min: 0.08
-    1h: 0.15
-    4h: 0.35
-    1day: 0.80
-  reaction_lookahead_bars: 20
-  new_peak_bars: 12
-  max_distance_pct: 5.0
-  cluster_tolerance_pct: 0.04
-  zone_padding_pct: 0.02
-  minimum_zone_score: 6
-  max_resistance_zones: 3
-  max_support_zones: 2
-
-# /dinh chỉ sinh Entry/SL/TP sau khi gate nến đóng đã xác nhận.
-peak_execution:
-  require_1h_close_confirmation: true
-  require_daily_context: true
-  daily_opposition_limit: 0.15
-  entry_buffer_atr: 0.15
-  stop_buffer_atr: 0.20
-  minimum_structural_rr: 1.5
-  take_profit_1_r: 1.0
-  # SL dung theo cau truc, nhung neu xa hon 7 gia tu bat ky diem khop trong Entry thi bo keo.
-  maximum_stop_distance: 7.0
-
-peak_liquidity:
-  block_weekend_entries: true
-  # Cho phep Entry den truoc 05:00 sang thu Bay, theo gio Viet Nam.
-  weekend_cutoff_hour_vn: 5
-  recent_volume_hours: 6
-  volume_baseline_hours: 720
-  minimum_volume_ratio: 0.45
-  maximum_spread_bps: 3.0
-
-# Chi mo ta dau hieu gia/volume; khong khang dinh quy lon hay market maker dung sau bien dong.
-liquidity_traps:
-  sweep_lookback_bars: 8
-  sweep_buffer_atr: 0.08
-  minimum_wick_ratio: 0.38
-  maximum_entry_candle_range_atr: 2.20
-  minimum_fomo_body_ratio: 0.68
-  maximum_ema_extension_atr: 1.80
-
-# Diem 90/80/70 la do hoan thien setup, KHONG phai % thang.
-setup_quality:
-  # Chi tat sau khi co >=100 lenh out-of-sample/forward va ket qua sau phi dat nguong chap nhan.
-  paper_only: true
-  backtest_summary_path: "logs/peak_backtest_summary.json"
-  backtest_trades_path: "logs/peak_backtest_trades.json"
-  minimum_trade_score: 70
-  risk_pct_score_90: 0.50
-  risk_pct_score_80: 0.35
-  risk_pct_score_70: 0.20
-
-# Lich FOMC lay tu Federal Reserve va cache 6h. Them CPI/NFP/PCE/BoE/NBS vao manual_events
-# khi co lich UTC chinh thuc; trong cua so HIGH bot khong sinh Entry moi.
-macro_guard:
-  enabled: true
-  fetch_fomc_calendar: true
-  fomc_calendar_url: "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm"
-  # FOMC statement thuong luc 14:00 New York; code tu doi 18/19 UTC theo DST.
-  fomc_decision_hour_et: 14
-  block_minutes_before: 720
-  block_minutes_after: 360
-  calendar_cache_hours: 6
-  timeout_seconds: 10
-  fail_closed_if_calendar_unavailable: true
-  # Vi du:
-  # manual_events:
-  #   - {name: "US CPI", at_utc: "2026-08-12T12:30:00Z", source: "https://www.bls.gov/schedule/"}
-  manual_events: []
-
-backtest:
-  assumed_spread_bps: 1.0
-  minimum_daily_bars: 40
-  validation:
-    minimum_trades: 100
-    minimum_profit_factor: 1.20
-    minimum_average_net_r: 0.0
-
-# Theo doi mot vi the nguoi dung da tu vao. Bot khong doc tai khoan va khong tu dong dong lenh.
-manual_position:
-  enabled: true
-  poll_seconds: 10
-  state_path: "logs/manual_position_state.json"
-  atr_bars: 100
-  stop_atr_multiplier: 0.80
-  minimum_stop_distance_pct: 0.05
-  maximum_stop_distance: 7.0
-  take_profit_1_r: 1.0
-  take_profit_2_r: 2.0
-  loss_warning_r: 0.50
-  profit_reminder_r: 0.50
-  close_repeat_seconds: 30
-  reminder_interval_seconds: 180
-  status_interval_seconds: 300
-  error_backoff_seconds: 30
-  error_notice_seconds: 300
-  minimum_margin_usdt: 1.0
-  maximum_margin_usdt: 1000000
-  # Chi la gioi han du lieu dau vao de theo doi, khong phai khuyen nghi dung don bay cao.
-  maximum_leverage: 125
-  high_leverage_warning_x: 10
-
-auto_alerts:
-  enabled: true
-  poll_seconds: 30
-  # Quet gia nhanh chi sau khi da phat setup LONG/SHORT; vong nay khong goi AI.
-  active_poll_seconds: 10
-  first_check_seconds: 10
-  notify_on_start: true
-  notify_approaching: true
-  # Gui canh bao code truoc, sau do goi AI rieng va gui thong bao xac thuc thu hai.
-  ai_review_after_alert: true
-  approach_buffer_pct: 0.01
-  same_setup_cooldown_minutes: 240
-  setup_timeout_minutes: 90
-  active_wave_max_minutes: 480
-  micro_candle_bars: 30
-  micro_weakness_threshold: 0.35
-  # Cat som khi nen 1m sau Entry dong sai phia vung retest kem ap luc nguoc.
-  retest_failure_buffer_price: 0.50
-  retest_failure_buffer_r: 0.05
-  retest_failure_pressure_threshold: 0.20
-  adverse_warning_r: 0.35
-  runaway_cancel_r: 0.50
-  structure_flip_threshold: 0.15
-  error_backoff_seconds: 60
-  send_hourly_chart: true
-  state_path: "logs/auto_alert_state.json"
-
-# Chiến lược riêng cho biên nến M5 đầu phiên tối (giờ Việt Nam).
-# Nến mốc luôn là 20:30–20:35; bot chỉ quét và phát tín hiệu từ 20:35 đến trước 24:00.
-opening_range_m5:
-  enabled: true
-  notify_on_start: true
-  data_provider: "twelvedata"
-  symbol: "XAU/USD"
-  poll_seconds: 300
-  close_settle_seconds: 10
-  outputsize: 100
-  state_path: "logs/opening_range_m5_world_spot_state.json"
-  signal_max_age_seconds: 90
-  breakout_buffer_price: 0.0
-  retest_tolerance_price: 0.50
-  minimum_rejection_close_location: 0.65
-  stop_buffer_price: 0.20
-  price_tick: 0.01
+  retest_tolerance_atr: 0.18
+  minimum_rejection_close_location: 0.60
+  entry_tolerance_atr: 0.18
+  maximum_spread_atr: 0.12
+  # Sàn biến động: ATR khung vào lệnh phải >= 0.02% giá, nếu không thì bỏ qua
+  # (feed đứng/nghỉ lễ vẫn có thể cho score cao trên đúng một tick).
+  minimum_atr_ratio: 0.0002
+  stop_buffer_atr: 0.18
+  minimum_stop_atr: 0.65
+  maximum_stop_atr: 2.0
+  # Mức hủy setup cố định quanh cấu trúc retest, chỉ dùng sau xác nhận nến đóng.
+  invalidation_buffer_atr: 0.12
   take_profit_1_r: 1.5
-  take_profit_2_r: 2.0
+  take_profit_2_r: 2.5
 
-# Dataset de xem lai vi sao bot bao/khong bao. Moi snapshot la JSON tren mot dong.
-analysis_diagnostics:
-  enabled: true
-  directory: "logs/diagnostics"
-  retention_days: 365
-  max_file_mb: 50
-  recent_closed_candles:
-    15min: 8
-    1h: 6
-    4h: 4
-    1day: 3
+position_exit:
+  # Không thoát chỉ vì một wick hoặc RSI đơn lẻ. Cần phá cấu trúc + động lượng,
+  # hoặc ít nhất 2/3 khung 15m/1H/4H đảo chiều đồng thuận.
+  adverse_score_floor: 0.08
+  alignment_floor: 0.08
+  time_stop_bars_5m: 24
+  minimum_progress_r: 0.50
 
-news:
-  max_items: 4
-  feeds:
-    - name: "Vàng/Thị trường"
-      language: "vi"
-      url: "https://news.google.com/rss/search?q=XAU%2FUSD%20d%E1%BB%B1%20b%C3%A1o%20gi%C3%A1%20v%C3%A0ng%20when%3A3d&hl=vi&gl=VN&ceid=VN%3Avi"
-    - name: "Địa chính trị"
-      language: "vi"
-      url: "https://news.google.com/rss/search?q=gi%C3%A1%20v%C3%A0ng%20th%E1%BA%BF%20gi%E1%BB%9Bi%20Fed%20l%E1%BA%A1m%20ph%C3%A1t%20chi%E1%BA%BFn%20tranh%20Iran%20when%3A3d&hl=vi&gl=VN&ceid=VN%3Avi"
-
-order_book:
-  enabled: true
-  symbol: "XAUUSDT"
-  endpoint: "https://fapi.binance.com/fapi/v1/depth"
-  depth_limit: 100
-
-resistance_test:
-  cluster_atr: 0.35
-  padding_atr: 0.12
-  minimum_padding_pct: 0.00015
-  rsi_warning: 65
-  volume_spike_ratio: 1.5
-
-ai_analysis:
-  enabled: true
-  peak_review_enabled: true
-  timeout_seconds: 35
-  # Thong bao AI thu hai phai ket thuc (thanh cong hoac bao loi) trong khoang nay.
-  auto_review_total_timeout_seconds: 50
-  groq:
-    model: "qwen/qwen3.6-27b"
-    usage_path: "logs/groq_usage.json"
-    daily_call_budget: 900
-    rate_limit_cooldown_minutes: 2
-  gemini:
-    model: "gemini-3.6-flash"
-    fallback_model: "gemini-3.5-flash-lite"
-    usage_path: "logs/gemini_usage.json"
-    daily_call_budget: 15
-    rate_limit_cooldown_minutes: 60
+alerts:
+  telegram_enabled: true
+  entry_alerts: true
+  signal_cooldown_minutes: 60
+  four_hour_summary: true
+  daily_summary: true
+  state_path: logs/exness_alert_state.json
+  # Nhat ky tin hieu forward: moi tin Entry phat ra ghi mot dong JSON.
+  # Day la thu duy nhat cho phep cham diem hieu qua khi chay demo.
+  journal_path: logs/signal_journal.jsonl

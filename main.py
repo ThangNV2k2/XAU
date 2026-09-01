@@ -1,119 +1,40 @@
+"""One-shot command-line check using the same Exness scanner as Telegram."""
+
+from __future__ import annotations
+
 import argparse
-import json
-import logging
-import os
 from datetime import datetime, timezone
 
-import yaml
-from apscheduler.schedulers.blocking import BlockingScheduler
-from dotenv import load_dotenv
-
-from alerting.telegram_bot import TelegramAlerter
-from data_provider.binance_futures_provider import BinanceFuturesProvider
-from indicators.signal_engine import SignalResult, compute_signal
-from market_context import select_closed_candles
-
-load_dotenv()
-
-os.makedirs("logs", exist_ok=True)
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.FileHandler("logs/main.log"), logging.StreamHandler()],
-)
-logger = logging.getLogger("gold-signal")
-
-
-def load_config(path: str = "config.yaml") -> dict:
-    with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
-
-
-def format_alert(result: SignalResult) -> str:
-    lines = [
-        f"*Binance XAUUSDT PERP Signal: {result.signal}*",
-        f"Price: {result.price:.2f}",
-        f"Weighted score: {result.weighted_score:.2f}",
-        f"ATR(14): {result.atr:.2f} | Suggested stop distance: {result.suggested_stop_distance:.2f}",
-        "",
-        "Indicators:",
-    ]
-    for ind in result.indicators:
-        lines.append(f"  {ind.name}: value={ind.value:.2f} score={ind.score:+d}")
-    lines.append(f"\nTime: {result.timestamp}")
-    return "\n".join(lines)
-
-
-def run_once(
-    provider: BinanceFuturesProvider,
-    config: dict,
-    alerter: TelegramAlerter | None,
-    dry_run: bool,
-    last_signal: dict,
-) -> None:
-    interval = config["live"]["interval"]
-    df = select_closed_candles(
-        provider.get_historical(
-            interval=interval,
-            outputsize=config["live"]["outputsize"],
-        ),
-        interval,
-        datetime.now(timezone.utc),
-    )
-    weights = config["weights"]
-    thresholds = {"buy": config["threshold_buy"], "sell": config["threshold_sell"]}
-    result = compute_signal(df, weights, thresholds, atr_stop_multiplier=config.get("atr_stop_multiplier", 1.5))
-
-    logger.info(json.dumps(result.to_dict()))
-    print(json.dumps(result.to_dict(), indent=2))
-
-    if result.signal != "HOLD" and result.signal != last_signal.get("signal"):
-        message = format_alert(result)
-        if dry_run:
-            logger.info("[DRY RUN] Would send Telegram alert:\n%s", message)
-        else:
-            alerter.send(message)
-            logger.info("Telegram alert sent.")
-    last_signal["signal"] = result.signal
+from data_provider.exness_mt5_provider import ExnessConnectionError
+from lightweight_bot import build_client, load_config
+from market_scanner import ExnessMarketScanner
+from strategy_engine import format_analysis
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Binance Futures XAUUSDT signal polling bot")
-    parser.add_argument("--once", action="store_true", help="Run a single check and exit (no scheduler, no Telegram)")
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Run the polling loop but only log alerts instead of sending Telegram messages",
-    )
+    parser = argparse.ArgumentParser(description="Exness XAU/US-stock closed-candle scanner")
+    parser.add_argument("--symbol", default="XAUUSD", help="XAUUSD, AAPL, NVDA, FTNT...")
+    parser.add_argument("--all", action="store_true", help="Quét tất cả mã đang mở cửa")
     args = parser.parse_args()
 
     config = load_config()
-    market_data_config = config.get("market_data", {})
-    provider = BinanceFuturesProvider(
-        symbol=config.get("symbol", "XAUUSDT"),
-        base_url=market_data_config.get("base_url", "https://fapi.binance.com"),
-    )
-    last_signal: dict = {}
-
-    if args.once:
-        run_once(provider, config, alerter=None, dry_run=True, last_signal=last_signal)
-        return
-
-    alerter = None if args.dry_run else TelegramAlerter()
-
-    scheduler = BlockingScheduler()
-    scheduler.add_job(
-        run_once,
-        "interval",
-        minutes=config["live"]["poll_minutes"],
-        args=[provider, config, alerter, args.dry_run, last_signal],
-        next_run_time=datetime.now(),
-    )
-    logger.info("Starting polling loop every %s minutes...", config["live"]["poll_minutes"])
     try:
-        scheduler.start()
-    except (KeyboardInterrupt, SystemExit):
-        logger.info("Stopped.")
+        client = build_client(config)
+    except ExnessConnectionError as exc:
+        parser.exit(2, f"Lỗi Exness MT5: {exc}\n")
+    scanner = ExnessMarketScanner(client, config)
+    now = datetime.now(timezone.utc)
+    try:
+        assets = scanner.assets if args.all else [scanner.asset(args.symbol)]
+        for asset in assets:
+            outcome = scanner.scan_asset(asset, now, force=True)
+            if outcome.analysis:
+                print(format_analysis(outcome.analysis))
+            else:
+                print(f"{asset.symbol}: {outcome.status} · {outcome.reason}")
+            print()
+    finally:
+        client.shutdown()
 
 
 if __name__ == "__main__":
